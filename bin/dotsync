@@ -17,6 +17,7 @@ Setup (run once per machine):
   init                Set up dotsync on the first machine
   join                Set up dotsync on a second machine (pair w/ first)
   pair                Generate a one-time pairing code (called from join)
+  add-peer            Finish syncthing pairing — add a peer's device ID
   restore             Re-attach using an existing Keychain identity
   uninstall           Tear down a dotsync setup on this machine
 

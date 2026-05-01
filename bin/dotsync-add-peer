@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# dotsync-add-peer — add a peer's Syncthing device ID to this machine
+# and share the dotsync folder with them. The "second half" of the
+# pairing handshake — the joining machine adds us first, then prints
+# this command for the originating machine to run.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_common.sh"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_syncthing.sh"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<EOF
+dotsync add-peer — finish bidirectional pairing by adding a peer device.
+
+Usage: dotsync add-peer <device-id> [--name <label>]
+
+  <device-id>   The peer's Syncthing device ID (56 chars, base32, with
+                dashes). Printed by 'dotsync join' on the second machine.
+  --name        Optional human-readable label (default: derived from id).
+
+What it does:
+  1. POST /rest/config/devices to add the peer to this Syncthing.
+  2. PUT /rest/config/folders/<id> to add the peer to the folder's
+     shared-with list.
+  3. Both daemons can now discover each other and start syncing.
+
+Only meaningful in syncthing mode; errors out otherwise.
+EOF
+  exit 0
+fi
+
+[[ "${DOTSYNC_ENGINE:-syncthing}" == "syncthing" ]] \
+  || die "add-peer is syncthing-mode only (engine=$DOTSYNC_ENGINE)"
+
+[[ $# -ge 1 ]] || die "device ID required (try: dotsync add-peer <id>)"
+
+DEVICE_ID="$1"; shift
+NAME=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --name) NAME="$2"; shift 2 ;;
+    *)      die "unknown flag: $1" ;;
+  esac
+done
+
+# Basic device-ID format check — 7 groups of 7 chars, dash-separated.
+if ! [[ "$DEVICE_ID" =~ ^[A-Z0-9]{7}(-[A-Z0-9]{7}){6}$ ]]; then
+  die "device ID format looks wrong: $DEVICE_ID
+expected: 7 groups of 7 characters separated by dashes
+   e.g.: AAAAAAA-BBBBBBB-CCCCCCC-DDDDDDD-EEEEEEE-FFFFFFF-GGGGGGG"
+fi
+
+[[ -n "$NAME" ]] || NAME="${DEVICE_ID:0:7}"
+FOLDER_ID="${SYNCTHING_FOLDER_ID:-dotsync-data}"
+
+st_running || die "Syncthing daemon not reachable at $SYNCTHING_API_BASE"
+
+api_key="$(_st_api_key)" || die "no Syncthing API key cached"
+
+st_curl_with_key() {
+  local method="$1" path="$2" body="${3:-}"
+  if [[ -n "$body" ]]; then
+    curl -fsS --max-time 5 -H "X-API-Key: $api_key" -H "Content-Type: application/json" \
+      -X "$method" -d "$body" "${SYNCTHING_API_BASE}${path}"
+  else
+    curl -fsS --max-time 5 -H "X-API-Key: $api_key" -X "$method" "${SYNCTHING_API_BASE}${path}"
+  fi
+}
+
+# 1. Add the device.
+device_payload=$(jq -nc \
+  --arg id "$DEVICE_ID" \
+  --arg name "$NAME" \
+  '{deviceID: $id, name: $name, addresses: ["dynamic"], introducer: false}')
+st_curl_with_key POST /rest/config/devices "$device_payload" >/dev/null \
+  || die "could not add device"
+echo "✓ added device $NAME ($DEVICE_ID)"
+
+# 2. Share the folder with the new device.
+folder=$(st_curl_with_key GET "/rest/config/folders/$FOLDER_ID" 2>/dev/null) \
+  || die "folder $FOLDER_ID not found in Syncthing config"
+
+# Append to the folder's devices list (idempotent — Syncthing dedupes).
+updated_folder=$(echo "$folder" | jq --arg id "$DEVICE_ID" \
+  '.devices = (.devices + [{deviceID: $id}] | unique_by(.deviceID))')
+
+st_curl_with_key PUT "/rest/config/folders/$FOLDER_ID" "$updated_folder" >/dev/null \
+  || die "could not update folder shares"
+echo "✓ folder $FOLDER_ID now shared with $NAME"
+
+cat <<EOF
+
+Pairing complete. The two daemons will discover each other and start
+syncing within a few seconds.
+
+Verify:
+  dotsync status
+  open $SYNCTHING_API_BASE   # Syncthing's web UI shows connected peers
+EOF

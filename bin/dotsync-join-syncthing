@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+# dotsync-join-syncthing — second-machine wizard for the Syncthing engine.
+#
+# Steps:
+#   1. Preflight (same as init-syncthing — install syncthing if missing)
+#   2. Start Syncthing daemon, cache API key
+#   3. Receive pairing payload via wormhole
+#   4. Add the peer's device + share the folder via Syncthing REST API
+#   5. Profile selection + projects.json
+#   6. Write $DOTSYNC_CONFIG
+#   7. Install our launchd agent
+#   8. Print a 'dotsync add-peer <my-device-id>' command for the user to
+#      paste back on the first machine, completing the bidirectional pair
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOL_DIR="$(dirname "$SCRIPT_DIR")"
+
+CODE=""
+NON_INTERACTIVE=false
+FORCE=false
+PROJECT_ROOT_OVERRIDE=""
+
+usage() {
+  cat <<EOF
+dotsync join --engine syncthing — pair this machine with an existing setup.
+
+Usage: dotsync join [--code <code>] [--project-root <path>] [options]
+
+Options:
+  --code <code>          Wormhole pairing code from 'dotsync pair' (or paste when prompted).
+  --project-root <path>  Where source-code projects live (auto-detected).
+  --non-interactive      Skip prompts; --code required.
+  --force                Overwrite existing config.
+  -h, --help             Show this help.
+
+What it does:
+  1. Installs Syncthing via brew if missing.
+  2. Starts the Syncthing daemon (brew services start syncthing).
+  3. Receives the pairing payload via magic-wormhole.
+  4. Adds the peer's Syncthing device + shares the dotsync folder.
+  5. Writes ~/.config/dotsync/config.sh with DOTSYNC_ENGINE=syncthing.
+  6. Installs our launchd agent (capture/deploy every 60s).
+  7. Prints a 'dotsync add-peer <id>' command for the sender to run,
+     finishing the bidirectional pairing.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --code)            CODE="$2"; shift 2 ;;
+    --project-root)    PROJECT_ROOT_OVERRIDE="$2"; shift 2 ;;
+    --non-interactive) NON_INTERACTIVE=true; shift ;;
+    --force)           FORCE=true; shift ;;
+    -h|--help)         usage; exit 0 ;;
+    *)                 echo "unknown flag: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+step() { printf '\n→ %s\n' "$*"; }
+say()  { printf '  %s\n' "$*"; }
+fail() { printf '✗ %s\n' "$*" >&2; exit 1; }
+ask()  {
+  $NON_INTERACTIVE && { printf '%s' "$2"; return; }
+  local prompt="$1" default="$2" reply
+  if [[ -n "$default" ]]; then
+    read -rp "$prompt [$default]: " reply
+    printf '%s' "${reply:-$default}"
+  else
+    read -rp "$prompt: " reply
+    printf '%s' "$reply"
+  fi
+}
+
+# ── 1. Preflight ────────────────────────────────────────────────────
+step "Preflight"
+[[ "$(uname -s)" == "Darwin" ]] || fail "macOS only"
+command -v git  >/dev/null || fail "git required"
+command -v brew >/dev/null || fail "Homebrew required"
+
+require_or_install() {
+  command -v "$1" >/dev/null 2>&1 && return
+  say "installing $1"
+  brew install "$1" >/dev/null || fail "brew install $1 failed"
+}
+require_or_install jq
+require_or_install fswatch
+require_or_install magic-wormhole
+require_or_install syncthing
+
+# ── 2. Existing-config check ────────────────────────────────────────
+DOTSYNC_CONFIG="${DOTSYNC_CONFIG:-${HOME}/.config/dotsync/config.sh}"
+if [[ -f "$DOTSYNC_CONFIG" ]] && ! $FORCE; then
+  cat >&2 <<EOF
+✗ dotsync already configured at $DOTSYNC_CONFIG.
+
+Run 'dotsync uninstall' first if you want to start over.
+EOF
+  exit 1
+fi
+
+# ── 3. Start Syncthing ──────────────────────────────────────────────
+step "Starting Syncthing daemon"
+
+ST_API_BASE="http://127.0.0.1:8384"
+
+if ! brew services list 2>/dev/null | grep -q "^syncthing.*started"; then
+  brew services start syncthing >/dev/null 2>&1 || fail "brew services start syncthing failed"
+  say "started"
+else
+  say "already running"
+fi
+
+say "waiting for REST API…"
+for i in {1..30}; do
+  curl -fsS --max-time 2 "$ST_API_BASE/rest/system/ping" >/dev/null 2>&1 && break
+  sleep 1
+done
+curl -fsS --max-time 2 "$ST_API_BASE/rest/system/ping" >/dev/null 2>&1 \
+  || fail "Syncthing daemon did not respond after 30s"
+say "ready"
+
+ST_CFG_XML="${HOME}/Library/Application Support/Syncthing/config.xml"
+[[ -f "$ST_CFG_XML" ]] || fail "$ST_CFG_XML not found"
+ST_API_KEY="$(grep -oE '<apikey>[^<]+</apikey>' "$ST_CFG_XML" | head -1 | sed -E 's|</?apikey>||g')"
+[[ -n "$ST_API_KEY" ]] || fail "could not extract API key"
+
+ST_API_KEY_FILE="${HOME}/Library/Application Support/Syncthing/apikey"
+mkdir -p "$(dirname "$ST_API_KEY_FILE")"
+printf '%s' "$ST_API_KEY" > "$ST_API_KEY_FILE"
+chmod 600 "$ST_API_KEY_FILE"
+
+st_curl() {
+  local method="$1" path="$2" body="${3:-}"
+  if [[ -n "$body" ]]; then
+    curl -fsS --max-time 5 -H "X-API-Key: $ST_API_KEY" -H "Content-Type: application/json" \
+      -X "$method" -d "$body" "${ST_API_BASE}${path}"
+  else
+    curl -fsS --max-time 5 -H "X-API-Key: $ST_API_KEY" -X "$method" "${ST_API_BASE}${path}"
+  fi
+}
+
+MY_DEVICE_ID=$(st_curl GET /rest/system/status | jq -r '.myID')
+[[ -n "$MY_DEVICE_ID" && "$MY_DEVICE_ID" != "null" ]] || fail "could not retrieve this device's ID"
+
+# ── 4. Receive pairing payload via wormhole ─────────────────────────
+step "Receiving pairing payload"
+
+if [[ -z "$CODE" ]]; then
+  cat <<EOF
+
+  On your first machine, run:    dotsync pair
+  It will print a code like:      7-cobalt-elephant-mango
+EOF
+  echo
+  CODE="$(ask "Paste pairing code" "")"
+fi
+[[ -n "$CODE" ]] || fail "pairing code required"
+
+say "connecting via magic-wormhole…"
+output=$(wormhole receive "$CODE" 2>&1) \
+  || fail "wormhole receive failed: $(printf '%s' "$output" | tail -3)"
+
+# Pull the JSON payload out of wormhole's framing.
+payload=$(printf '%s\n' "$output" | grep -E '^\{' | head -1)
+[[ -n "$payload" ]] || fail "did not receive a valid pairing payload (output: $output)"
+
+PEER_ENGINE=$(echo "$payload" | jq -r '.engine // empty')
+PEER_DEVICE_ID=$(echo "$payload" | jq -r '.device_id // empty')
+PEER_FOLDER_ID=$(echo "$payload" | jq -r '.folder_id // empty')
+PEER_HOST=$(echo "$payload" | jq -r '.host // "unknown"')
+
+[[ "$PEER_ENGINE" == "syncthing" ]] \
+  || fail "received pairing payload for engine '$PEER_ENGINE' (this script handles syncthing)"
+[[ -n "$PEER_DEVICE_ID" && -n "$PEER_FOLDER_ID" ]] \
+  || fail "pairing payload missing device_id or folder_id"
+
+say "received payload from $PEER_HOST"
+say "  peer device: $PEER_DEVICE_ID"
+say "  folder:      $PEER_FOLDER_ID"
+
+# ── 5. Add the peer device + share the folder ───────────────────────
+step "Configuring Syncthing"
+
+# Add the peer device. Idempotent — POST to /rest/config/devices upserts.
+device_payload=$(jq -nc \
+  --arg id "$PEER_DEVICE_ID" \
+  --arg name "$PEER_HOST" \
+  '{deviceID: $id, name: $name, addresses: ["dynamic"], introducer: false}')
+st_curl POST /rest/config/devices "$device_payload" >/dev/null \
+  || fail "could not add peer device"
+say "added peer device"
+
+# Add or update the folder, sharing it with the peer.
+DOTSYNC_DATA_DIR="${DOTSYNC_DATA_DIR:-${HOME}/.dotsync-data}"
+mkdir -p "$DOTSYNC_DATA_DIR"
+
+folder_payload=$(jq -nc \
+  --arg id "$PEER_FOLDER_ID" \
+  --arg path "$DOTSYNC_DATA_DIR" \
+  --arg me "$MY_DEVICE_ID" \
+  --arg peer "$PEER_DEVICE_ID" \
+  '{
+    id: $id,
+    label: "dotsync data",
+    path: $path,
+    type: "sendreceive",
+    devices: [{deviceID: $me}, {deviceID: $peer}],
+    fsWatcherEnabled: true,
+    rescanIntervalS: 60
+  }')
+
+existing=$(st_curl GET "/rest/config/folders/$PEER_FOLDER_ID" 2>/dev/null || echo "")
+if [[ -n "$existing" && "$existing" != "null" ]]; then
+  st_curl PUT "/rest/config/folders/$PEER_FOLDER_ID" "$folder_payload" >/dev/null \
+    || fail "could not update folder"
+else
+  st_curl POST /rest/config/folders "$folder_payload" >/dev/null \
+    || fail "could not create folder"
+fi
+say "configured folder $PEER_FOLDER_ID at $DOTSYNC_DATA_DIR (shared with peer)"
+
+# ── 6. Project root ─────────────────────────────────────────────────
+step "Project root"
+detect_project_root() {
+  for c in "$HOME/code" "$HOME/dev" "$HOME/Workspace" "$HOME/projects"; do
+    [[ -d "$c" ]] || continue
+    n=$(find "$c" -mindepth 2 -maxdepth 2 -name '.git' -type d 2>/dev/null | wc -l | tr -d ' ')
+    [[ "$n" -gt 0 ]] && { printf '%s' "$c"; return; }
+  done
+}
+if [[ -n "$PROJECT_ROOT_OVERRIDE" ]]; then
+  PROJECT_ROOT="$PROJECT_ROOT_OVERRIDE"
+else
+  detected="$(detect_project_root)"
+  if [[ -n "$detected" ]]; then
+    say "detected: $detected"
+    PROJECT_ROOT="$(ask "Project root for this machine" "$detected")"
+  else
+    PROJECT_ROOT="$(ask "Project root for this machine" "$HOME")"
+  fi
+fi
+
+# ── 7. Write config ─────────────────────────────────────────────────
+step "Writing config"
+KC_SERVICE="${DOTSYNC_KC_SERVICE:-dev.dotsync.envsync}"
+
+mkdir -p "$(dirname "$DOTSYNC_CONFIG")"
+cat > "$DOTSYNC_CONFIG" <<EOF
+# dotsync config — generated by dotsync join --engine syncthing on $(date -u +%Y-%m-%dT%H:%M:%SZ)
+DOTSYNC_ENGINE="syncthing"
+DOTSYNC_DATA_DIR="$DOTSYNC_DATA_DIR"
+DOTSYNC_KC_SERVICE="$KC_SERVICE"
+DOTSYNC_PROJECT_ROOT="$PROJECT_ROOT"
+DOTSYNC_SESSION_MAX_MB=50
+DOTSYNC_SKIP_PROJECTS=""
+SYNCTHING_FOLDER_ID="$PEER_FOLDER_ID"
+SYNCTHING_API_BASE="$ST_API_BASE"
+EOF
+say "wrote $DOTSYNC_CONFIG"
+
+# ── 8. Install launchd agent ────────────────────────────────────────
+step "Installing dotsync launchd agent"
+LABEL="$KC_SERVICE"
+plist_dest="$HOME/Library/LaunchAgents/${LABEL}.plist"
+mkdir -p "$(dirname "$plist_dest")"
+sed -e "s|__LABEL__|$LABEL|g" \
+    -e "s|__TOOL_DIR__|$TOOL_DIR|g" \
+    -e "s|__DATA_DIR__|$DOTSYNC_DATA_DIR|g" \
+    -e "s|__HOME__|$HOME|g" \
+    -e "s|__CONFIG__|$DOTSYNC_CONFIG|g" \
+    "$TOOL_DIR/launchd/dev.dotsync.envsync.plist.template" > "$plist_dest"
+plutil -lint "$plist_dest" >/dev/null || fail "plist invalid"
+launchctl unload "$plist_dest" 2>/dev/null || true
+launchctl load -w "$plist_dest" || fail "launchctl load failed"
+say "loaded $plist_dest"
+
+# ── 9. Done — print the second-half pairing command ─────────────────
+cat <<EOF
+
+✅ This machine joined.
+
+  Engine:           syncthing
+  This device:      $MY_DEVICE_ID
+  Peer:             $PEER_HOST ($PEER_DEVICE_ID)
+  Folder:           $PEER_FOLDER_ID at $DOTSYNC_DATA_DIR
+  Daemons running:
+    - syncthing (brew services)
+    - $LABEL (launchd) — capture/deploy every 60s
+
+To complete the pairing, run this on the FIRST machine:
+
+  dotsync add-peer $MY_DEVICE_ID
+
+Once that command finishes, both Syncthing daemons will discover each
+other and sync the folder. Run 'dotsync status' to confirm.
+EOF

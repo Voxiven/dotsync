@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# dotsync-pair-syncthing — emit Syncthing pairing payload via wormhole.
+#
+# Payload (JSON, sent as wormhole text):
+#   {
+#     "engine":    "syncthing",
+#     "device_id": "<this machine's Syncthing device ID>",
+#     "folder_id": "<the dotsync folder ID>",
+#     "host":      "<this machine's hostname for log/UI display>"
+#   }
+#
+# The receiver (dotsync-join-syncthing) configures their local Syncthing
+# to add this device + share the folder. The receiver then prints a
+# 'dotsync add-peer <id>' command for the sender to run, completing the
+# bidirectional handshake.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_common.sh"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_syncthing.sh"
+
+CODE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help)
+      cat <<EOF
+dotsync pair --engine syncthing — generate a pairing code for adding a peer.
+
+Usage: dotsync pair [--code <code>]
+
+Emits this machine's Syncthing device ID + folder ID via magic-wormhole.
+Run 'dotsync join' on the second machine; paste the code there.
+
+After the receiver completes their join, they'll print a single
+'dotsync add-peer <id>' command for you to run here, which finishes
+the bidirectional pairing.
+
+Options:
+  --code <code>   Use a fixed wormhole code instead of an auto-generated
+                  one. Useful for scripted/coordinated tests.
+EOF
+      exit 0
+      ;;
+    --code) CODE="$2"; shift 2 ;;
+    *) echo "unknown flag: $1" >&2; exit 1 ;;
+  esac
+done
+
+command -v wormhole >/dev/null 2>&1 || die "magic-wormhole not installed (brew install magic-wormhole)"
+st_running || die "Syncthing daemon not reachable at $SYNCTHING_API_BASE — is it running?"
+
+# Pull our device ID from Syncthing's REST API.
+api_key="$(_st_api_key)" || die "no Syncthing API key (run 'dotsync init --engine syncthing' first)"
+my_id=$(curl -fsS --max-time 5 -H "X-API-Key: $api_key" \
+  "${SYNCTHING_API_BASE}/rest/system/status" 2>/dev/null | jq -r '.myID')
+[[ -n "$my_id" && "$my_id" != "null" ]] || die "could not retrieve this device's ID from Syncthing"
+
+folder_id="${SYNCTHING_FOLDER_ID:-dotsync-data}"
+hostname="$(hostname -s)"
+
+payload=$(jq -nc \
+  --arg engine "syncthing" \
+  --arg device_id "$my_id" \
+  --arg folder_id "$folder_id" \
+  --arg host "$hostname" \
+  '{engine: $engine, device_id: $device_id, folder_id: $folder_id, host: $host}')
+
+cat <<EOF
+Generating pairing code via magic-wormhole…
+Hand the code to the other machine when 'dotsync join' prompts for it.
+
+This machine's Syncthing device ID:
+  $my_id
+
+After the receiver finishes, they'll print a 'dotsync add-peer <id>'
+command — run it here to complete pairing.
+
+EOF
+
+if [[ -n "$CODE" ]]; then
+  exec wormhole send --text "$payload" --code "$CODE"
+else
+  exec wormhole send --text "$payload"
+fi

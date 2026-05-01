@@ -1,217 +1,42 @@
 #!/usr/bin/env bash
-# dotsync-join — second-machine wizard. Receives the encryption identity
-# from a first-machine `dotsync pair` invocation, clones the data repo,
-# unlocks it, installs the daemon.
+# dotsync join — dispatcher. Default engine: syncthing (v0.4).
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-TOOL_DIR="$(dirname "$SCRIPT_DIR")"
 
-REPO_URL=""
-BRANCH="main"
-CODE=""
-NON_INTERACTIVE=false
-FORCE=false
-
-usage() {
-  cat <<EOF
-dotsync join — set up dotsync on a second machine.
-
-Usage: dotsync join [options]
-
-Options:
-  --repo <url>          Data repo URL (or paste when prompted).
-  --branch <name>       Branch to track (default: main).
-  --code <code>         Wormhole pairing code from 'dotsync pair' (or paste when prompted).
-  --non-interactive     Skip prompts; --repo and --code required.
-  --force               Overwrite existing config.
-  -h, --help            Show help.
-
-What it does:
-  1. Installs missing dependencies via Homebrew.
-  2. Receives the age identity from the other machine via magic-wormhole.
-  3. Stores the identity in this Keychain.
-  4. Clones the data repo and unlocks it.
-  5. Installs a launchd agent (auto-syncs every 60 seconds).
-  6. Runs an initial sync.
-EOF
-}
-
+ENGINE="${DOTSYNC_ENGINE:-}"
+ARGS=()
+HELP_REQUESTED=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --repo)            REPO_URL="$2"; shift 2 ;;
-    --branch)          BRANCH="$2"; shift 2 ;;
-    --code)            CODE="$2"; shift 2 ;;
-    --non-interactive) NON_INTERACTIVE=true; shift ;;
-    --force)           FORCE=true; shift ;;
-    -h|--help)         usage; exit 0 ;;
-    *)                 echo "unknown flag: $1" >&2; usage; exit 1 ;;
+    --engine) ENGINE="$2"; shift 2 ;;
+    --engine=*) ENGINE="${1#*=}"; shift ;;
+    -h|--help) HELP_REQUESTED=true; shift ;;
+    *) ARGS+=("$1"); shift ;;
   esac
 done
 
-step() { printf '\n→ %s\n' "$*"; }
-say()  { printf '  %s\n' "$*"; }
-fail() { printf '✗ %s\n' "$*" >&2; exit 1; }
-ask()  {
-  $NON_INTERACTIVE && { printf '%s' "$2"; return; }
-  local prompt="$1" default="$2" reply
-  if [[ -n "$default" ]]; then
-    read -rp "$prompt [$default]: " reply
-    printf '%s' "${reply:-$default}"
-  else
-    read -rp "$prompt: " reply
-    printf '%s' "$reply"
-  fi
-}
-
-DOTSYNC_CONFIG="${DOTSYNC_CONFIG:-${HOME}/.config/dotsync/config.sh}"
-if [[ -f "$DOTSYNC_CONFIG" ]] && ! $FORCE; then
-  cat >&2 <<EOF
-✗ dotsync already initialized at $DOTSYNC_CONFIG.
-
-To set up a SECOND dotsync instance alongside the existing one:
-  DOTSYNC_CONFIG=~/.config/dotsync/config-other.sh \\
-  DOTSYNC_DATA_DIR=~/.dotsync-data-other \\
-  DOTSYNC_KC_SERVICE=other.dotsync.envsync \\
-    dotsync join --repo <url>
-
-To REPLACE the existing setup (destroys data and config):
-  dotsync uninstall    # ← much safer than --force
-  dotsync join --repo <url>
-
-Only use --force if you understand it'll rm -rf $DOTSYNC_DATA_DIR and
-overwrite $DOTSYNC_CONFIG.
-EOF
-  exit 1
-fi
-
-# ── 1. Preflight ────────────────────────────────────────────────────
-step "Preflight"
-[[ "$(uname -s)" == "Darwin" ]] || fail "macOS only"
-command -v git  >/dev/null || fail "git required"
-command -v brew >/dev/null || fail "Homebrew required (https://brew.sh/)"
-
-require_or_install() {
-  command -v "$1" >/dev/null 2>&1 && return
-  say "installing $1"
-  brew install "$1" >/dev/null || fail "brew install $1 failed"
-}
-require_or_install git-crypt
-require_or_install age
-require_or_install jq
-require_or_install fswatch
-require_or_install magic-wormhole
-
-# ── 2. Repo URL ─────────────────────────────────────────────────────
-step "Data repo"
-[[ -n "$REPO_URL" ]] || REPO_URL="$(ask "Data repo URL" "")"
-[[ -n "$REPO_URL" ]] || fail "data repo URL required"
-
-DOTSYNC_DATA_DIR="${DOTSYNC_DATA_DIR:-${HOME}/.dotsync-data}"
-[[ -d "$DOTSYNC_DATA_DIR/.git" ]] && ! $FORCE \
-  && fail "$DOTSYNC_DATA_DIR already exists; rm -rf it first"
-
-# ── 3. Receive identity via wormhole ────────────────────────────────
-step "Receiving encryption identity"
-if [[ -z "$CODE" ]]; then
+if $HELP_REQUESTED && [[ -z "$ENGINE" ]]; then
   cat <<EOF
+dotsync join — set up dotsync on a second machine using a pairing code.
 
-  On your first machine, run:    dotsync pair
-  It will print a code like:      7-cobalt-elephant-mango
+Usage: dotsync join [--engine <git|syncthing>] [other-engine-options]
+
+Engine defaults to syncthing in v0.4. Use --engine git to join a v0.3
+git-based setup.
+
+Per-engine help:
+  dotsync join --engine syncthing --help
+  dotsync join --engine git --help
 EOF
-  echo
-  CODE="$(ask "Paste pairing code" "")"
-fi
-[[ -n "$CODE" ]] || fail "pairing code required"
-
-say "connecting via magic-wormhole…"
-# wormhole receive prints the message to stdout; framing text goes to
-# stderr. Grep for the AGE-SECRET-KEY line to be robust.
-output=$(wormhole receive "$CODE" 2>&1) \
-  || fail "wormhole receive failed: $(printf '%s' "$output" | tail -3)"
-identity=$(printf '%s\n' "$output" | grep -E '^AGE-SECRET-KEY-' | head -1)
-[[ -n "$identity" ]] || fail "did not receive a valid age identity (output: $output)"
-
-KC_SERVICE="${DOTSYNC_KC_SERVICE:-dev.dotsync.envsync}"
-KC_ACCOUNT="${DOTSYNC_KC_ACCOUNT:-default}"
-security add-generic-password -s "$KC_SERVICE" -a "$KC_ACCOUNT" -U -w "$identity" \
-  || fail "could not store identity in Keychain"
-say "identity stored in Keychain (service=$KC_SERVICE)"
-
-# ── 4. Project root ─────────────────────────────────────────────────
-step "Project root"
-detect_project_root() {
-  for c in "$HOME/code" "$HOME/dev" "$HOME/Workspace" "$HOME/projects" "$HOME/LearnToCode/GamesProject"; do
-    [[ -d "$c" ]] || continue
-    n=$(find "$c" -mindepth 2 -maxdepth 2 -name '.git' -type d 2>/dev/null | wc -l | tr -d ' ')
-    [[ "$n" -gt 0 ]] && { printf '%s' "$c"; return; }
-  done
-}
-detected="$(detect_project_root)"
-if [[ -n "$detected" ]]; then
-  say "detected: $detected"
-  PROJECT_ROOT="$(ask "Project root for this machine" "$detected")"
-else
-  PROJECT_ROOT="$(ask "Project root for this machine" "$HOME")"
+  exit 0
 fi
 
-# ── 5. Write config ─────────────────────────────────────────────────
-step "Writing config"
-mkdir -p "$(dirname "$DOTSYNC_CONFIG")"
-cat > "$DOTSYNC_CONFIG" <<EOF
-# dotsync config — generated by dotsync join on $(date -u +%Y-%m-%dT%H:%M:%SZ)
-DOTSYNC_DATA_DIR="$DOTSYNC_DATA_DIR"
-DOTSYNC_DATA_REMOTE="$REPO_URL"
-DOTSYNC_DATA_BRANCH="$BRANCH"
-DOTSYNC_KC_SERVICE="$KC_SERVICE"
-DOTSYNC_KC_ACCOUNT="$KC_ACCOUNT"
-DOTSYNC_PROJECT_ROOT="$PROJECT_ROOT"
-DOTSYNC_SESSION_MAX_MB=50
-DOTSYNC_SKIP_PROJECTS=""
-EOF
-say "wrote $DOTSYNC_CONFIG"
+ENGINE="${ENGINE:-syncthing}"
+$HELP_REQUESTED && ARGS+=("--help")
 
-# ── 6. Clone + unlock ───────────────────────────────────────────────
-step "Cloning data repo"
-[[ -d "$DOTSYNC_DATA_DIR" ]] && rm -rf "$DOTSYNC_DATA_DIR"
-git clone -b "$BRANCH" "$REPO_URL" "$DOTSYNC_DATA_DIR" --quiet || fail "clone failed"
-
-# shellcheck source=/dev/null
-source "$SCRIPT_DIR/_common.sh"
-# shellcheck source=/dev/null
-source "$SCRIPT_DIR/_crypt.sh"
-unlock_repo
-
-# ── 7. Daemon ───────────────────────────────────────────────────────
-step "Installing launchd agent"
-LABEL="$KC_SERVICE"
-plist_dest="$HOME/Library/LaunchAgents/${LABEL}.plist"
-mkdir -p "$(dirname "$plist_dest")"
-sed -e "s|__LABEL__|$LABEL|g" \
-    -e "s|__TOOL_DIR__|$TOOL_DIR|g" \
-    -e "s|__DATA_DIR__|$DOTSYNC_DATA_DIR|g" \
-    -e "s|__HOME__|$HOME|g" \
-    -e "s|__CONFIG__|$DOTSYNC_CONFIG|g" \
-    "$TOOL_DIR/launchd/dev.dotsync.envsync.plist.template" > "$plist_dest"
-plutil -lint "$plist_dest" >/dev/null || fail "plist invalid"
-launchctl unload "$plist_dest" 2>/dev/null || true
-launchctl load -w "$plist_dest" || fail "launchctl load failed"
-say "loaded $plist_dest"
-
-# ── 8. First sync ───────────────────────────────────────────────────
-step "Initial sync"
-if "$SCRIPT_DIR/env-sync"; then
-  say "initial sync OK"
-else
-  say "(initial sync had issues — run 'dotsync logs' to inspect)"
-fi
-
-cat <<EOF
-
-✅ dotsync joined.
-
-  Repo:    $REPO_URL ($BRANCH)
-  Daemon:  running (every 60s)
-
-Run 'dotsync status' to confirm health.
-EOF
+case "$ENGINE" in
+  syncthing) exec "$SCRIPT_DIR/dotsync-join-syncthing" "${ARGS[@]}" ;;
+  git)       exec "$SCRIPT_DIR/dotsync-join-git" "${ARGS[@]}" ;;
+  *) echo "✗ unknown engine: $ENGINE" >&2; exit 1 ;;
+esac

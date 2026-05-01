@@ -1,60 +1,46 @@
 #!/usr/bin/env bash
-# dotsync-pair — emit a one-time pairing code so a second machine can receive
-# the encryption identity from this machine's Keychain.
-#
-# Identity travels peer-to-peer over magic-wormhole (PAKE). The rendezvous
-# server sees only ciphertext; the code is required to derive the session
-# key and is single-use.
+# dotsync pair — dispatcher. Routes based on $DOTSYNC_ENGINE in the
+# current config (or override via --engine).
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=/dev/null
-source "$SCRIPT_DIR/_common.sh"
-# shellcheck source=/dev/null
-source "$SCRIPT_DIR/_crypt.sh"
 
-CODE=""
+# Source config to learn current engine.
+DOTSYNC_CONFIG="${DOTSYNC_CONFIG:-${HOME}/.config/dotsync/config.sh}"
+[[ -f "$DOTSYNC_CONFIG" ]] && source "$DOTSYNC_CONFIG" 2>/dev/null
+
+ENGINE="${DOTSYNC_ENGINE:-}"
+ARGS=()
+HELP_REQUESTED=false
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -h|--help)
-      cat <<EOF
-dotsync pair — generate a one-time pairing code for adding a second machine.
-
-Usage: dotsync pair [--code <code>]
-
-Run on a machine that's already been set up with 'dotsync init'. Prints a
-short code (e.g. "7-cobalt-elephant-mango"). On the second machine, run:
-
-  dotsync join
-
-It will prompt for the code. The encryption identity transfers
-peer-to-peer; magic-wormhole's rendezvous server sees only ciphertext.
-The code is single-use and expires after a few minutes.
-
-Options:
-  --code <code>   Use a fixed code instead of an auto-generated one.
-                  Format: N-word-word-word (any well-formed wormhole code).
-                  Useful for scripted tests where both sides need to know
-                  the code in advance.
-EOF
-      exit 0
-      ;;
-    --code) CODE="$2"; shift 2 ;;
-    *) echo "unknown flag: $1" >&2; exit 1 ;;
+    --engine) ENGINE="$2"; shift 2 ;;
+    --engine=*) ENGINE="${1#*=}"; shift ;;
+    -h|--help) HELP_REQUESTED=true; shift ;;
+    *) ARGS+=("$1"); shift ;;
   esac
 done
 
-command -v wormhole >/dev/null 2>&1 || die "magic-wormhole not installed (brew install magic-wormhole)"
-kc_has_identity || die "no age identity in this Keychain — run 'dotsync init' first"
+if $HELP_REQUESTED && [[ -z "$ENGINE" ]]; then
+  cat <<EOF
+dotsync pair — emit a one-time pairing code for adding a second machine.
 
-identity="$(kc_get_identity)"
+Usage: dotsync pair [--engine <git|syncthing>]
 
-echo "Generating pairing code via magic-wormhole…"
-echo "Hand the code to the other machine when 'dotsync join' prompts for it."
-echo
+Engine is auto-detected from your config. Override with --engine.
 
-if [[ -n "$CODE" ]]; then
-  exec wormhole send --text "$identity" --code "$CODE"
-else
-  exec wormhole send --text "$identity"
+Per-engine help:
+  dotsync pair --engine syncthing --help
+  dotsync pair --engine git --help
+EOF
+  exit 0
 fi
+
+ENGINE="${ENGINE:-syncthing}"
+$HELP_REQUESTED && ARGS+=("--help")
+
+case "$ENGINE" in
+  syncthing) exec "$SCRIPT_DIR/dotsync-pair-syncthing" "${ARGS[@]}" ;;
+  git)       exec "$SCRIPT_DIR/dotsync-pair-git" "${ARGS[@]}" ;;
+  *) echo "✗ unknown engine: $ENGINE" >&2; exit 1 ;;
+esac
