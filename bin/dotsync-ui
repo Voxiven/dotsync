@@ -1,20 +1,9 @@
 #!/usr/bin/env python3
-"""
-dotsync-ui — local status dashboard at http://127.0.0.1:7878
+"""dotsync-ui — local status dashboard at http://127.0.0.1:7878.
 
-Reads existing state files (no new state introduced):
-  - $DOTSYNC_DATA_DIR/.last-sync
-  - $DOTSYNC_DATA_DIR/.sync-paused
-  - $HOME/.dotsync-conflicts/<ts>/
-  - $HOME/Library/Logs/dotsync.log
-  - $DOTSYNC_DATA_DIR/registry/*.json
-  - profiles/*.json from the tool dir
-  - git log on the data repo for peer activity
-
-POST endpoints invoke other dotsync subcommands via subprocess:
-  - /api/sync   → dotsync sync
-  - /api/pause  → dotsync pause   (TODO once implemented)
-  - /api/resume → dotsync resume  (TODO once implemented)
+Reads on-disk state and proxies actions to the dotsync subcommands. The
+page is a static HTML/JS shell; everything dynamic flows through
+GET /api/status (JSON) and POST /api/{sync,pause,resume,clean-conflicts}.
 """
 from __future__ import annotations
 
@@ -24,13 +13,40 @@ import http.server
 import json
 import os
 import re
-import shlex
+import secrets
+import shutil
+import signal
 import socketserver
 import subprocess
 import sys
+import threading
 import urllib.parse
 import webbrowser
 from pathlib import Path
+
+VERSION = "0.5.0"
+
+# Token for non-loopback access. Empty = auth disabled (loopback-only mode).
+# Populated by main() on startup; checked by Handler.
+UI_TOKEN: str = ""
+
+
+def load_or_create_token(state_dir: Path) -> str:
+    """Load ~/.dotsync-state/ui-token; create on first call. Mode 0600."""
+    state_dir.mkdir(parents=True, exist_ok=True)
+    token_file = state_dir / "ui-token"
+    if token_file.exists():
+        tok = token_file.read_text().strip()
+        if tok:
+            return tok
+    tok = secrets.token_hex(32)  # 256 bits, hex-encoded
+    token_file.write_text(tok)
+    try:
+        os.chmod(token_file, 0o600)
+    except OSError:
+        pass
+    return tok
+
 
 # ── Configuration loading ─────────────────────────────────────────────
 
@@ -41,13 +57,15 @@ def load_config() -> dict:
         "DOTSYNC_DATA_DIR": os.environ.get(
             "DOTSYNC_DATA_DIR", str(Path.home() / ".dotsync-data")
         ),
+        "DOTSYNC_STATE_DIR": os.environ.get(
+            "DOTSYNC_STATE_DIR", str(Path.home() / ".dotsync-state")
+        ),
         "DOTSYNC_KC_SERVICE": os.environ.get(
             "DOTSYNC_KC_SERVICE", "dev.dotsync.envsync"
         ),
         "DOTSYNC_PROJECT_ROOT": os.environ.get(
             "DOTSYNC_PROJECT_ROOT", str(Path.home())
         ),
-        "DOTSYNC_ENGINE": os.environ.get("DOTSYNC_ENGINE", "syncthing"),
         "SYNCTHING_FOLDER_ID": os.environ.get("SYNCTHING_FOLDER_ID", "dotsync-data"),
         "SYNCTHING_API_BASE": os.environ.get(
             "SYNCTHING_API_BASE", "http://127.0.0.1:8384"
@@ -69,7 +87,7 @@ def tool_dir() -> Path:
 # ── Syncthing REST API helpers ───────────────────────────────────────
 
 
-def _st_api_key(cfg: dict) -> str | None:
+def _st_api_key() -> str | None:
     """Read the cached Syncthing API key, or extract from config.xml."""
     cached = Path.home() / "Library/Application Support/Syncthing/apikey"
     if cached.exists():
@@ -82,8 +100,7 @@ def _st_api_key(cfg: dict) -> str | None:
 
 
 def _st_call(cfg: dict, path: str) -> dict | list | None:
-    """GET a Syncthing REST endpoint; return parsed JSON or None on error."""
-    api_key = _st_api_key(cfg)
+    api_key = _st_api_key()
     if not api_key:
         return None
     import urllib.request
@@ -97,57 +114,86 @@ def _st_call(cfg: dict, path: str) -> dict | list | None:
         return None
 
 
-def gather_syncthing_status(cfg: dict) -> dict:
-    """Return engine-specific status: folder state, peers, conflicts."""
-    folder_id = cfg["SYNCTHING_FOLDER_ID"]
-
-    # Daemon up?
+def gather_syncthing(cfg: dict) -> dict:
     sys_status = _st_call(cfg, "/rest/system/status")
     if not sys_status:
         return {"running": False}
 
+    folder_id = cfg["SYNCTHING_FOLDER_ID"]
+    version_data = _st_call(cfg, "/rest/system/version") or {}
     folder_status = _st_call(cfg, f"/rest/db/status?folder={folder_id}") or {}
     connections = _st_call(cfg, "/rest/system/connections") or {}
     devices = _st_call(cfg, "/rest/config/devices") or []
 
-    # Build per-peer view: {device_name: {connected, address, last_seen}}.
     my_id = sys_status.get("myID", "")
-    device_names = {d["deviceID"]: d.get("name") or d["deviceID"][:7] for d in devices}
+    device_names = {
+        d["deviceID"]: d.get("name") or d["deviceID"][:7] for d in devices
+    }
     conn_map = (connections.get("connections") or {})
-    peers: dict[str, dict] = {}
+    peers: list[dict] = []
     for dev_id, name in device_names.items():
         if dev_id == my_id:
             continue
         c = conn_map.get(dev_id, {})
-        peers[name] = {
+        peers.append({
+            "name": name,
             "device_id": dev_id,
+            "device_id_short": dev_id.split("-")[0] if dev_id else "",
             "connected": c.get("connected", False),
             "address": c.get("address", ""),
             "in_bytes": c.get("inBytesTotal", 0),
             "out_bytes": c.get("outBytesTotal", 0),
-        }
+        })
 
-    # Find sync-conflict files in the data dir.
-    data_dir = Path(cfg["DOTSYNC_DATA_DIR"])
-    conflicts: list[str] = []
-    if data_dir.exists():
-        for p in data_dir.rglob("*.sync-conflict-*"):
-            if p.is_file():
-                conflicts.append(str(p.relative_to(data_dir)))
+    global_bytes = max(folder_status.get("globalBytes", 1) or 1, 1)
+    in_sync_pct = folder_status.get("inSyncBytes", 0) / global_bytes * 100
 
     return {
         "running": True,
         "my_id": my_id,
-        "version": sys_status.get("version", ""),
+        "version": version_data.get("version", ""),
         "folder_id": folder_id,
         "folder_state": folder_status.get("state", "unknown"),
-        "folder_global_files": folder_status.get("globalFiles", 0),
-        "folder_local_files": folder_status.get("localFiles", 0),
-        "folder_in_sync_pct": folder_status.get("inSyncBytes", 0) /
-            max(folder_status.get("globalBytes", 1), 1) * 100,
+        "global_files": folder_status.get("globalFiles", 0),
+        "local_files": folder_status.get("localFiles", 0),
+        "in_sync_pct": in_sync_pct,
         "peers": peers,
-        "conflicts": conflicts,
     }
+
+
+# ── Conflict scanning ────────────────────────────────────────────────
+
+
+# Sidecar pattern: <name>.sync-conflict-YYYYMMDD-HHMMSS-<DEVICE7>(.<ext>)?
+_CONFLICT_RE = re.compile(
+    r"^(?P<stem>.+)\.sync-conflict-\d{8}-\d{6}-[A-Z0-9]{7}(?P<ext>\.[^./]+)?$"
+)
+
+
+def scan_conflicts(data_dir: Path) -> list[dict]:
+    out: list[dict] = []
+    if not data_dir.exists():
+        return out
+    for p in data_dir.rglob("*.sync-conflict-*"):
+        if not p.is_file():
+            continue
+        m = _CONFLICT_RE.match(p.name)
+        if m:
+            canonical_name = m.group("stem") + (m.group("ext") or "")
+        else:
+            canonical_name = p.name
+        rel_dir = p.parent.relative_to(data_dir)
+        canonical_rel = (
+            str(rel_dir / canonical_name) if str(rel_dir) != "." else canonical_name
+        )
+        out.append({
+            "sidecar": str(p.relative_to(data_dir)),
+            "canonical": canonical_rel,
+            "size": p.stat().st_size,
+            "is_jsonl": canonical_name.endswith(".jsonl"),
+            "exists": (p.parent / canonical_name).exists(),
+        })
+    return out
 
 
 # ── Status gathering ──────────────────────────────────────────────────
@@ -155,27 +201,16 @@ def gather_syncthing_status(cfg: dict) -> dict:
 
 def gather_status(cfg: dict) -> dict:
     data_dir = Path(cfg["DOTSYNC_DATA_DIR"])
+    state_dir = Path(cfg["DOTSYNC_STATE_DIR"])
     home = Path.home()
 
-    # Last sync timestamp.
     last_sync = ""
-    last_sync_file = data_dir / ".last-sync"
+    last_sync_file = state_dir / "last-sync"
     if last_sync_file.exists():
         last_sync = last_sync_file.read_text().strip()
 
-    # Paused flag.
-    paused = (data_dir / ".sync-paused").exists()
+    paused = (state_dir / "sync-paused").exists()
 
-    # Conflicts.
-    conflicts_dir = home / ".dotsync-conflicts"
-    conflicts: list[dict] = []
-    if conflicts_dir.exists():
-        for p in sorted(conflicts_dir.iterdir()):
-            if p.is_dir() and p.name != "_resolved":
-                files = sorted(f.name for f in p.iterdir() if f.is_file())
-                conflicts.append({"id": p.name, "files": files})
-
-    # Daemon state (launchctl).
     daemon = "unknown"
     try:
         out = subprocess.run(
@@ -185,45 +220,17 @@ def gather_status(cfg: dict) -> dict:
     except Exception:
         pass
 
-    # Git branch.
-    branch = "?"
-    if (data_dir / ".git").exists():
-        try:
-            branch = subprocess.run(
-                ["git", "-C", str(data_dir), "rev-parse", "--abbrev-ref", "HEAD"],
-                capture_output=True, text=True, timeout=2,
-            ).stdout.strip()
-        except Exception:
-            pass
+    syncthing = gather_syncthing(cfg)
+    conflicts = scan_conflicts(data_dir)
 
-    # Peers (last commit per author/hostname over last 50 commits).
-    peers: dict[str, str] = {}
-    if (data_dir / ".git").exists():
-        try:
-            log = subprocess.run(
-                ["git", "-C", str(data_dir), "log", "-50", "--format=%an|%ai|%s"],
-                capture_output=True, text=True, timeout=3,
-            ).stdout
-            for line in log.splitlines():
-                parts = line.split("|", 2)
-                if len(parts) < 3:
-                    continue
-                author, when, subject = parts
-                # Pull hostname out of "auto-sync <host> <iso-ts>" subjects.
-                m = re.match(r"^auto-sync\s+(\S+)\s+", subject)
-                key = m.group(1) if m else author
-                if key not in peers:
-                    peers[key] = when
-        except Exception:
-            pass
-
-    # Profiles.
     profiles: list[dict] = []
-    enabled = set()
+    enabled: set[str] = set()
     enabled_file = data_dir / "registry" / "enabled-profiles.json"
     if enabled_file.exists():
         try:
-            enabled = set(json.loads(enabled_file.read_text()).get("profiles", []))
+            enabled = set(
+                json.loads(enabled_file.read_text()).get("profiles", []) or []
+            )
         except Exception:
             pass
     profiles_dir = tool_dir() / "profiles"
@@ -241,368 +248,751 @@ def gather_status(cfg: dict) -> dict:
             except Exception:
                 pass
 
-    # Tracked secrets (legacy registry).
-    secrets: list[dict] = []
+    tracked: list[dict] = []
     secrets_file = data_dir / "registry" / "secrets.json"
     if secrets_file.exists():
         try:
-            secrets = json.loads(secrets_file.read_text()).get("secrets", [])
+            secrets = json.loads(secrets_file.read_text()).get("secrets", []) or []
+            tracked = [
+                {
+                    "repo_path": s.get("repo_path", "?"),
+                    "real_path": s.get("real_path", "?"),
+                }
+                for s in secrets
+            ]
         except Exception:
             pass
 
-    # Project list.
-    projects: list[str] = []
-    projects_file = data_dir / "registry" / "projects.json"
-    if projects_file.exists():
-        try:
-            d = json.loads(projects_file.read_text())
-            projects = [p.get("name", "?") for p in d.get("projects", [])]
-        except Exception:
-            pass
-
-    # Recent log lines.
     log_file = home / "Library" / "Logs" / "dotsync.log"
     log_tail: list[str] = []
     if log_file.exists():
         try:
             with log_file.open() as f:
-                log_tail = f.readlines()[-30:]
+                log_tail = [line.rstrip() for line in f.readlines()[-30:]]
         except Exception:
             pass
 
-    engine = cfg.get("DOTSYNC_ENGINE", "git")
-    syncthing: dict | None = None
-    if engine == "syncthing":
-        syncthing = gather_syncthing_status(cfg)
-        # Engine-specific surfaces override the git-derived ones:
-        # peers come from Syncthing connections; conflicts come from
-        # the *.sync-conflict-* sidecar scan.
-        if syncthing.get("running"):
-            peers = {
-                name: ("connected" if p["connected"] else "offline")
-                for name, p in syncthing["peers"].items()
-            }
-            conflicts = [
-                {"id": Path(c).parent.name or "<root>", "files": [Path(c).name]}
-                for c in syncthing.get("conflicts", [])
-            ]
-            branch = "syncthing:" + syncthing.get("folder_state", "?")
+    # Overall health classification — single source of truth for the badge.
+    if paused:
+        health = "paused"
+    elif conflicts:
+        health = "conflicts"
+    elif not syncthing.get("running"):
+        health = "down"
+    elif daemon != "loaded":
+        health = "no-daemon"
+    elif not any(p["connected"] for p in syncthing.get("peers", [])):
+        health = "no-peers"
+    else:
+        health = "healthy"
 
     return {
-        "engine": engine,
+        "version": VERSION,
         "service": cfg["DOTSYNC_KC_SERVICE"],
         "data_dir": str(data_dir),
-        "branch": branch,
+        "state_dir": str(state_dir),
         "last_sync": last_sync,
         "paused": paused,
-        "conflicts": conflicts,
         "daemon": daemon,
-        "peers": peers,
-        "profiles": profiles,
-        "secrets": secrets,
-        "projects": projects,
-        "log_tail": [l.rstrip() for l in log_tail],
+        "health": health,
         "syncthing": syncthing,
+        "conflicts": conflicts,
+        "profiles": profiles,
+        "tracked": tracked,
+        "log_tail": log_tail,
         "now": dt.datetime.utcnow().isoformat() + "Z",
     }
 
 
-# ── HTML rendering ────────────────────────────────────────────────────
+# ── HTML / JS shell ───────────────────────────────────────────────────
 
 
-HTML_TEMPLATE = r"""<!DOCTYPE html>
+PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta http-equiv="refresh" content="10">
-<title>dotsync — {service}</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dotsync</title>
 <style>
-  :root {{
-    --bg: #0d1117;
-    --panel: #161b22;
-    --border: #30363d;
-    --text: #c9d1d9;
-    --muted: #8b949e;
-    --accent: #58a6ff;
-    --good: #3fb950;
-    --warn: #d29922;
-    --bad:  #f85149;
-  }}
-  * {{ box-sizing: border-box; }}
-  body {{
-    margin: 0; padding: 24px;
-    font-family: -apple-system, BlinkMacSystemFont, "SF Pro", system-ui, sans-serif;
-    background: var(--bg); color: var(--text);
-    font-size: 14px; line-height: 1.5;
-  }}
-  h1, h2 {{ margin: 0 0 12px; font-weight: 600; }}
-  h1 {{ font-size: 22px; }}
-  h2 {{ font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 24px; }}
-  a {{ color: var(--accent); text-decoration: none; }}
-  .header {{ display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }}
-  .badge {{
-    display: inline-block; padding: 2px 8px; border-radius: 12px;
-    font-size: 11px; font-weight: 600; text-transform: uppercase;
-  }}
-  .badge.good {{ background: rgba(63, 185, 80, 0.15); color: var(--good); }}
-  .badge.warn {{ background: rgba(210, 153, 34, 0.15); color: var(--warn); }}
-  .badge.bad  {{ background: rgba(248, 81, 73, 0.15); color: var(--bad); }}
-  .meta {{ color: var(--muted); font-size: 13px; margin-bottom: 24px; }}
-  .panel {{
-    background: var(--panel); border: 1px solid var(--border);
-    border-radius: 6px; padding: 16px; margin-bottom: 16px;
-  }}
-  table {{ width: 100%; border-collapse: collapse; }}
-  th, td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }}
-  th {{ font-weight: 500; color: var(--muted); font-size: 12px; }}
-  tr:last-child td {{ border-bottom: none; }}
-  pre {{ margin: 0; font-family: "SF Mono", Menlo, Consolas, monospace;
-         font-size: 12px; color: var(--muted); white-space: pre-wrap;
-         max-height: 280px; overflow-y: auto; }}
-  .pill {{
-    display: inline-block; padding: 1px 6px; border-radius: 3px;
-    font-size: 11px; background: rgba(88, 166, 255, 0.1); color: var(--accent);
-  }}
-  button {{
-    font: inherit; padding: 6px 14px; border: 1px solid var(--border);
-    background: var(--panel); color: var(--text); border-radius: 4px;
-    cursor: pointer; margin-right: 8px;
-  }}
-  button:hover {{ background: #21262d; border-color: var(--accent); }}
-  .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
-  @media (max-width: 800px) {{ .grid {{ grid-template-columns: 1fr; }} }}
-  .empty {{ color: var(--muted); font-style: italic; padding: 12px 0; }}
+  :root {
+    color-scheme: dark;
+    --bg: #0a0e14;
+    --elevated: #11161e;
+    --elevated-2: #161c25;
+    --border: #1f2937;
+    --border-strong: #2d3748;
+    --text: #e6e8eb;
+    --muted: #7a818c;
+    --muted-strong: #9aa0aa;
+    --accent: #7dd3fc;
+    --good: #86efac;
+    --good-bg: rgba(134, 239, 172, 0.1);
+    --warn: #fcd34d;
+    --warn-bg: rgba(252, 211, 77, 0.1);
+    --bad: #fca5a5;
+    --bad-bg: rgba(252, 165, 165, 0.1);
+    --info-bg: rgba(125, 211, 252, 0.1);
+    --shadow: 0 1px 2px rgba(0,0,0,0.3), 0 0 0 1px var(--border);
+    --radius: 10px;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter",
+                 system-ui, sans-serif;
+    font-size: 13.5px;
+    line-height: 1.55;
+    background: var(--bg);
+    color: var(--text);
+    font-feature-settings: "tnum", "ss01";
+    -webkit-font-smoothing: antialiased;
+  }
+  main {
+    max-width: 920px;
+    margin: 0 auto;
+    padding: 32px 24px 80px;
+  }
+  h1 {
+    margin: 0;
+    font-size: 18px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  h2 {
+    margin: 0 0 12px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, .mono { font-family: var(--mono); font-size: 0.92em; }
+
+  header {
+    display: flex; align-items: center; gap: 12px;
+    margin-bottom: 4px;
+  }
+  .meta {
+    color: var(--muted);
+    font-size: 12.5px;
+    margin-bottom: 28px;
+    font-family: var(--mono);
+    word-break: break-all;
+  }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 10px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    background: var(--elevated-2);
+    color: var(--muted-strong);
+  }
+  .pill .dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: currentColor;
+    box-shadow: 0 0 0 3px color-mix(in srgb, currentColor 20%, transparent);
+  }
+  .pill.good { background: var(--good-bg); color: var(--good); }
+  .pill.warn { background: var(--warn-bg); color: var(--warn); }
+  .pill.bad  { background: var(--bad-bg);  color: var(--bad); }
+  .pill.info { background: var(--info-bg); color: var(--accent); }
+
+  .card {
+    background: var(--elevated);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 18px 20px;
+    margin-bottom: 16px;
+  }
+
+  .stat-row {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 14px;
+    margin-bottom: 24px;
+  }
+  .stat {
+    background: var(--elevated);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 16px 18px;
+    display: flex; flex-direction: column; gap: 6px;
+  }
+  .stat .label {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em;
+    color: var(--muted); font-weight: 600;
+  }
+  .stat .value {
+    font-size: 22px; font-weight: 600; letter-spacing: -0.01em;
+  }
+  .stat .sub {
+    font-size: 12px; color: var(--muted);
+  }
+  .stat .value em { font-style: normal; color: var(--muted); font-weight: 400; }
+
+  .actions {
+    display: flex; gap: 8px; flex-wrap: wrap;
+    margin-top: 14px;
+  }
+  button {
+    font: inherit; font-size: 12.5px; font-weight: 500;
+    padding: 6px 14px;
+    border-radius: 6px;
+    border: 1px solid var(--border-strong);
+    background: var(--elevated-2);
+    color: var(--text);
+    cursor: pointer;
+    transition: 80ms ease border-color, 80ms ease background;
+  }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: 0.5; cursor: progress; }
+  button.primary { background: var(--accent); color: #0a0e14; border-color: var(--accent); font-weight: 600; }
+  button.primary:hover { background: color-mix(in srgb, var(--accent) 90%, white); }
+  button.danger { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, var(--border-strong)); }
+
+  table { width: 100%; border-collapse: collapse; }
+  th, td {
+    text-align: left; padding: 9px 8px; vertical-align: middle;
+    border-bottom: 1px solid var(--border);
+  }
+  th {
+    font-size: 11px; font-weight: 600; color: var(--muted);
+    text-transform: uppercase; letter-spacing: 0.06em;
+  }
+  tr:last-child td { border-bottom: none; }
+
+  .empty {
+    color: var(--muted); font-style: italic;
+    padding: 6px 0; font-size: 13px;
+  }
+
+  details > summary {
+    cursor: pointer; padding: 8px 0;
+    list-style: none;
+    font-size: 12px;
+    color: var(--muted-strong);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  details > summary::-webkit-details-marker { display: none; }
+  details > summary::before {
+    content: "▸"; display: inline-block;
+    margin-right: 6px;
+    transition: transform 120ms ease;
+  }
+  details[open] > summary::before { transform: rotate(90deg); }
+
+  pre {
+    margin: 0; padding: 12px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--muted-strong);
+    background: var(--bg);
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    white-space: pre-wrap; word-break: break-word;
+    max-height: 360px; overflow: auto;
+  }
+
+  .conflict-row {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; padding: 10px 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .conflict-row:last-child { border-bottom: none; }
+  .conflict-row .file {
+    font-family: var(--mono); font-size: 12px;
+    color: var(--text); word-break: break-all;
+  }
+  .conflict-row .meta-line { font-size: 11.5px; color: var(--muted); margin-top: 2px; }
+
+  .toast {
+    position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+    background: var(--elevated-2); color: var(--text);
+    padding: 10px 18px; border-radius: 8px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.4), 0 0 0 1px var(--border-strong);
+    font-size: 13px; opacity: 0; pointer-events: none;
+    transition: opacity 200ms ease, transform 200ms ease;
+    z-index: 99;
+  }
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(-4px); }
+  .toast.error { color: var(--bad); }
+
+  footer {
+    margin-top: 32px;
+    color: var(--muted); font-size: 11.5px;
+    text-align: center;
+  }
+
+  @media (max-width: 720px) {
+    .stat-row { grid-template-columns: 1fr; }
+    main { padding: 20px 16px 60px; }
+  }
 </style>
 </head>
 <body>
+<main>
+  <header>
+    <h1>dotsync</h1>
+    <span id="health" class="pill"><span class="dot"></span><span data-text></span></span>
+  </header>
+  <div class="meta" id="meta"></div>
 
-<div class="header">
-  <h1>dotsync</h1>
-  {status_badge}
-</div>
-<div class="meta">{service} · {data_dir} <span class="pill">{branch}</span></div>
-
-<div class="grid">
-  <div class="panel">
-    <h2>Sync state</h2>
-    <table>
-      <tr><th>Last sync</th><td>{last_sync_html}</td></tr>
-      <tr><th>Daemon</th><td>{daemon}</td></tr>
-      <tr><th>Conflicts</th><td>{conflict_count}</td></tr>
-      <tr><th>Now</th><td>{now}</td></tr>
-    </table>
-    <div style="margin-top: 12px;">
-      <form action="/api/sync" method="post" style="display:inline;">
-        <button type="submit">Sync now</button>
-      </form>
-      {pause_button}
+  <div class="stat-row">
+    <div class="stat">
+      <div class="label">Last sync</div>
+      <div class="value" id="lastSync"><em>—</em></div>
+      <div class="sub" id="lastSyncSub"></div>
+    </div>
+    <div class="stat">
+      <div class="label">Peers</div>
+      <div class="value" id="peerCount"><em>—</em></div>
+      <div class="sub" id="peerSub"></div>
+    </div>
+    <div class="stat">
+      <div class="label">Conflicts</div>
+      <div class="value" id="conflictCount"><em>—</em></div>
+      <div class="sub" id="conflictSub"></div>
     </div>
   </div>
 
-  <div class="panel">
+  <div class="card">
+    <h2>Actions</h2>
+    <div class="actions">
+      <button id="actSync" class="primary">Sync now</button>
+      <button id="actPause">Pause</button>
+      <button id="actClean">Resolve conflicts</button>
+      <button id="actSyncthing">Open Syncthing UI</button>
+    </div>
+  </div>
+
+  <div id="conflictsCard" class="card" hidden>
+    <h2>Conflicts</h2>
+    <div id="conflictList"></div>
+    <div class="actions">
+      <button id="actMergeAll" class="primary">Merge JSONL + clean state</button>
+    </div>
+    <div class="empty" style="margin-top:8px;">
+      Session <code>.jsonl</code> conflicts merge by line-union (no data lost).
+      Other user-content conflicts need manual review — open the file and decide which side to keep.
+    </div>
+  </div>
+
+  <div class="card">
     <h2>Peers</h2>
-    {peers_html}
+    <div id="peerList"></div>
   </div>
-</div>
 
-<div class="panel">
-  <h2>Profiles</h2>
-  {profiles_html}
-</div>
-
-{syncthing_panel}
-
-{conflicts_panel}
-
-<div class="grid">
-  <div class="panel">
-    <h2>Projects</h2>
-    {projects_html}
+  <div class="card">
+    <h2>Profiles</h2>
+    <div id="profileList"></div>
   </div>
-  <div class="panel">
-    <h2>Tracked secrets</h2>
-    {secrets_html}
+
+  <div id="trackedCard" class="card" hidden>
+    <h2>Tracked items</h2>
+    <div id="trackedList"></div>
   </div>
-</div>
 
-<div class="panel">
-  <h2>Recent log</h2>
-  <pre>{log_html}</pre>
-</div>
+  <div class="card">
+    <details>
+      <summary>Syncthing details</summary>
+      <div id="stDetail" style="margin-top:8px;"></div>
+    </details>
+  </div>
 
-<div class="meta" style="margin-top: 24px;">
-  Auto-refresh every 10s · dotsync v{version}
-</div>
+  <div class="card">
+    <details>
+      <summary>Recent activity</summary>
+      <pre id="logTail" style="margin-top:8px;"></pre>
+    </details>
+  </div>
 
+  <footer>
+    dotsync v<span id="ver"></span> · auto-refresh every 5s ·
+    <a href="#" id="refreshNow">refresh now</a>
+  </footer>
+</main>
+
+<div id="toast" class="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+// Token capture + persistence: when arriving at /?token=X, save the token
+// to localStorage and strip it from the URL (don't leave it in browser
+// history or share links). All subsequent requests carry it as an
+// X-Dotsync-Token header.
+const TOKEN_KEY = "dotsync.token";
+(function captureToken() {
+  const url = new URL(location.href);
+  const t = url.searchParams.get("token");
+  if (t) {
+    localStorage.setItem(TOKEN_KEY, t);
+    url.searchParams.delete("token");
+    history.replaceState(null, "", url.pathname + (url.search || "") + url.hash);
+  }
+})();
+function authedFetch(path, opts) {
+  opts = opts || {};
+  const tok = localStorage.getItem(TOKEN_KEY);
+  const headers = Object.assign({}, opts.headers || {});
+  if (tok) headers["X-Dotsync-Token"] = tok;
+  return fetch(path, Object.assign({}, opts, { headers, cache: "no-store" }));
+}
+function handleAuthFailure() {
+  // Either we have no token, or it's wrong. Clear and bounce to login.
+  localStorage.removeItem(TOKEN_KEY);
+  location.href = "/?err=1";
+}
+
+function relTime(iso) {
+  if (!iso) return null;
+  const t = Date.parse(iso.replace(/Z$/, "Z"));
+  if (isNaN(t)) return null;
+  const sec = Math.max(0, Math.round((Date.now() - t) / 1000));
+  if (sec < 60) return sec + "s ago";
+  if (sec < 3600) return Math.round(sec/60) + "m ago";
+  if (sec < 86400) return Math.round(sec/3600) + "h ago";
+  return Math.round(sec/86400) + "d ago";
+}
+
+function fmtBytes(n) {
+  if (!n) return "0 B";
+  const u = ["B","KB","MB","GB","TB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(n >= 100 ? 0 : 1) + " " + u[i];
+}
+
+function escape(s) {
+  return String(s ?? "").replace(/[&<>"]/g, c =>
+    ({"&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;"}[c]));
+}
+
+function renderHealth(health) {
+  const el = $("health");
+  const text = el.querySelector("[data-text]");
+  const cls = {
+    healthy: "good",
+    "no-peers": "info",
+    conflicts: "warn",
+    paused: "bad",
+    "no-daemon": "bad",
+    down: "bad",
+  }[health] || "info";
+  el.className = "pill " + cls;
+  text.textContent = ({
+    healthy: "healthy",
+    "no-peers": "no peers",
+    conflicts: "conflicts",
+    paused: "paused",
+    "no-daemon": "no daemon",
+    down: "syncthing down",
+  }[health] || health);
+}
+
+function render(s) {
+  renderHealth(s.health);
+  $("ver").textContent = s.version;
+
+  const stRunning = s.syncthing && s.syncthing.running;
+  const folderState = stRunning ? s.syncthing.folder_state : "—";
+  $("meta").innerHTML =
+    escape(s.service) + " · " +
+    escape(s.data_dir) + " " +
+    '<span class="pill info" style="vertical-align:middle;">syncthing: ' +
+    escape(folderState) + "</span>";
+
+  // Last sync
+  if (s.last_sync) {
+    $("lastSync").textContent = relTime(s.last_sync) || s.last_sync;
+    $("lastSyncSub").textContent = s.last_sync;
+  } else if (stRunning) {
+    $("lastSync").innerHTML = '<em>continuous</em>';
+    $("lastSyncSub").textContent = "Syncthing replicates in real time";
+  } else {
+    $("lastSync").innerHTML = '<em>—</em>';
+    $("lastSyncSub").textContent = "";
+  }
+
+  // Peers
+  const peers = stRunning ? (s.syncthing.peers || []) : [];
+  const conn = peers.filter(p => p.connected).length;
+  $("peerCount").textContent = String(peers.length);
+  $("peerSub").textContent = peers.length === 0 ? "no peers paired"
+    : conn + " connected / " + (peers.length - conn) + " offline";
+
+  // Peer table
+  if (peers.length) {
+    $("peerList").innerHTML =
+      "<table><tr><th>Machine</th><th>Status</th><th>Address</th><th>Traffic</th></tr>" +
+      peers.map(p =>
+        "<tr><td><code>" + escape(p.name) + "</code></td>" +
+        "<td><span class='pill " + (p.connected ? "good" : "bad") + "'>" +
+          "<span class='dot'></span>" + (p.connected ? "connected" : "offline") +
+        "</span></td>" +
+        "<td class='mono'>" + escape(p.address || "—") + "</td>" +
+        "<td class='mono'>↑ " + fmtBytes(p.out_bytes) + " / ↓ " + fmtBytes(p.in_bytes) + "</td></tr>"
+      ).join("") + "</table>";
+  } else {
+    $("peerList").innerHTML = stRunning
+      ? '<div class="empty">No peers paired. Run <code>dotsync pair</code> to add one.</div>'
+      : '<div class="empty">Syncthing daemon not reachable.</div>';
+  }
+
+  // Conflicts
+  $("conflictCount").textContent = String(s.conflicts.length);
+  $("conflictSub").textContent = s.conflicts.length === 0
+    ? "all clear"
+    : s.conflicts.filter(c => c.is_jsonl).length + " mergeable, " +
+      s.conflicts.filter(c => !c.is_jsonl).length + " manual";
+  if (s.conflicts.length) {
+    $("conflictsCard").hidden = false;
+    $("conflictList").innerHTML = s.conflicts.map(c =>
+      "<div class='conflict-row'>" +
+        "<div>" +
+          "<div class='file'>" + escape(c.canonical) + "</div>" +
+          "<div class='meta-line'>" +
+            (c.is_jsonl ? '<span class="pill info" style="margin-right:6px;">jsonl</span>' :
+                          '<span class="pill warn" style="margin-right:6px;">manual</span>') +
+            fmtBytes(c.size) + " · sidecar: " + escape(c.sidecar) +
+          "</div>" +
+        "</div>" +
+      "</div>"
+    ).join("");
+  } else {
+    $("conflictsCard").hidden = true;
+  }
+
+  // Profiles
+  if (s.profiles.length) {
+    $("profileList").innerHTML =
+      "<table>" +
+      s.profiles.map(p =>
+        "<tr><td style='width:24px;color:" + (p.enabled ? "var(--good)" : "var(--muted)") + ";'>" +
+          (p.enabled ? "✓" : "·") + "</td>" +
+        "<td><b>" + escape(p.name) + "</b>" +
+          (p.experimental ? ' <span class="pill info">experimental</span>' : "") +
+        "</td>" +
+        "<td>" + escape(p.description) + "</td>" +
+        "<td style='color:var(--muted);text-align:right;'>" + p.paths + " paths</td></tr>"
+      ).join("") + "</table>";
+  } else {
+    $("profileList").innerHTML = '<div class="empty">No profiles defined.</div>';
+  }
+
+  // Tracked
+  if (s.tracked && s.tracked.length) {
+    $("trackedCard").hidden = false;
+    $("trackedList").innerHTML =
+      "<table><tr><th>Repo path</th><th>Real path</th></tr>" +
+      s.tracked.map(t =>
+        "<tr><td><code>" + escape(t.repo_path) + "</code></td>" +
+        "<td><code>" + escape(t.real_path) + "</code></td></tr>"
+      ).join("") + "</table>";
+  } else {
+    $("trackedCard").hidden = true;
+  }
+
+  // Pause/resume button
+  const pauseBtn = $("actPause");
+  pauseBtn.textContent = s.paused ? "Resume" : "Pause";
+  pauseBtn.dataset.action = s.paused ? "resume" : "pause";
+
+  // Resolve button only enabled when there are conflicts
+  $("actClean").disabled = !s.conflicts.length;
+
+  // Syncthing details
+  if (stRunning) {
+    const st = s.syncthing;
+    $("stDetail").innerHTML =
+      "<table>" +
+      "<tr><th>Version</th><td>" + escape(st.version || "—") + "</td></tr>" +
+      "<tr><th>This device</th><td><code>" + escape(st.my_id || "—") + "</code></td></tr>" +
+      "<tr><th>Folder</th><td><code>" + escape(st.folder_id) + "</code> · " +
+        escape(st.folder_state) + "</td></tr>" +
+      "<tr><th>In sync</th><td>" + st.in_sync_pct.toFixed(1) + "% · " +
+        st.local_files + " local / " + st.global_files + " global files</td></tr>" +
+      "<tr><th>Daemon</th><td>" + escape(s.daemon) + "</td></tr>" +
+      "</table>";
+  } else {
+    $("stDetail").innerHTML =
+      '<div class="empty">Syncthing not reachable. Start it with: ' +
+      '<code>brew services start syncthing</code></div>';
+  }
+
+  // Log
+  $("logTail").textContent = s.log_tail.length
+    ? s.log_tail.join("\n")
+    : "(no log entries yet)";
+}
+
+let toastTimer;
+function toast(msg, isError) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = "toast show" + (isError ? " error" : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { t.className = "toast"; }, 4000);
+}
+
+async function refresh() {
+  try {
+    const r = await authedFetch("/api/status");
+    if (r.status === 401) return handleAuthFailure();
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const s = await r.json();
+    render(s);
+  } catch (e) {
+    toast("Failed to load status: " + e.message, true);
+  }
+}
+
+async function action(path, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const r = await authedFetch(path, { method: "POST" });
+    if (r.status === 401) return handleAuthFailure();
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.error || ("HTTP " + r.status));
+    if (body.message) toast(body.message);
+    await refresh();
+  } catch (e) {
+    toast("Action failed: " + e.message, true);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+$("actSync").addEventListener("click", e => action("/api/sync", e.currentTarget));
+$("actPause").addEventListener("click", e =>
+  action("/api/" + e.currentTarget.dataset.action, e.currentTarget));
+$("actClean").addEventListener("click", e => action("/api/clean-conflicts", e.currentTarget));
+$("actMergeAll").addEventListener("click", e => action("/api/clean-conflicts", e.currentTarget));
+$("actSyncthing").addEventListener("click", () =>
+  window.open("http://127.0.0.1:8384/", "_blank"));
+$("refreshNow").addEventListener("click", e => { e.preventDefault(); refresh(); });
+
+refresh();
+setInterval(refresh, 5000);
+</script>
 </body>
-</html>"""
+</html>
+"""
 
 
-def html_escape(s: str) -> str:
-    return (
-        s.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
+# ── Login page (served when token is missing on non-loopback requests) ──
 
 
-def render_html(status: dict, version: str) -> str:
-    # Status badge
-    if status["paused"]:
-        badge = '<span class="badge bad">paused</span>'
-    elif status["conflicts"]:
-        badge = '<span class="badge warn">conflicts</span>'
-    elif status["daemon"] == "loaded":
-        badge = '<span class="badge good">healthy</span>'
-    else:
-        badge = '<span class="badge warn">no daemon</span>'
-
-    # Last sync — highlight if stale.
-    last_sync_html = html_escape(status["last_sync"]) or "<em>never</em>"
-    if status["last_sync"]:
-        try:
-            ts = dt.datetime.fromisoformat(status["last_sync"].replace("Z", "+00:00"))
-            age_s = (dt.datetime.now(dt.timezone.utc) - ts).total_seconds()
-            if age_s < 90:
-                last_sync_html += f' <span class="pill">{int(age_s)}s ago</span>'
-            elif age_s < 3600:
-                last_sync_html += f' <span class="pill">{int(age_s/60)}m ago</span>'
-            else:
-                last_sync_html += f' <span class="pill">{int(age_s/3600)}h ago</span>'
-        except Exception:
-            pass
-
-    # Pause/resume button
-    if status["paused"]:
-        pause_button = '<form action="/api/resume" method="post" style="display:inline;"><button type="submit">Resume</button></form>'
-    else:
-        pause_button = '<form action="/api/pause" method="post" style="display:inline;"><button type="submit">Pause</button></form>'
-
-    # Peers
-    if status["peers"]:
-        rows = "".join(
-            f"<tr><td>{html_escape(host)}</td><td>{html_escape(when)}</td></tr>"
-            for host, when in status["peers"].items()
-        )
-        peers_html = f"<table><tr><th>Machine</th><th>Last commit</th></tr>{rows}</table>"
-    else:
-        peers_html = '<div class="empty">No peers seen yet.</div>'
-
-    # Profiles
-    if status["profiles"]:
-        rows = []
-        for p in status["profiles"]:
-            mark = "✓" if p["enabled"] else "·"
-            tag = ' <span class="pill">experimental</span>' if p["experimental"] else ""
-            rows.append(
-                f"<tr><td>{mark}</td><td><b>{html_escape(p['name'])}</b>{tag}</td>"
-                f"<td>{html_escape(p['description'])}</td>"
-                f"<td>{p['paths']} paths</td></tr>"
-            )
-        profiles_html = (
-            "<table><tr><th></th><th>Profile</th><th>Description</th><th></th></tr>"
-            + "".join(rows) + "</table>"
-        )
-    else:
-        profiles_html = '<div class="empty">No profiles defined.</div>'
-
-    # Syncthing engine panel (only when active)
-    syncthing_panel = ""
-    if status.get("engine") == "syncthing" and status.get("syncthing"):
-        st = status["syncthing"]
-        if not st.get("running"):
-            syncthing_panel = (
-                '<div class="panel"><h2>Syncthing</h2>'
-                '<div class="empty">daemon not reachable. '
-                'Check: <code>brew services list | grep syncthing</code></div></div>'
-            )
-        else:
-            in_sync_pct = st.get("folder_in_sync_pct", 0)
-            color = "good" if in_sync_pct > 99 else ("warn" if in_sync_pct > 80 else "bad")
-            syncthing_panel = (
-                f'<div class="panel"><h2>Syncthing</h2>'
-                f'<table>'
-                f'<tr><th>Version</th><td>{html_escape(st.get("version", "?"))}</td></tr>'
-                f'<tr><th>This device</th><td><code>{html_escape(st.get("my_id", "?"))}</code></td></tr>'
-                f'<tr><th>Folder</th><td>{html_escape(st.get("folder_id", "?"))}'
-                f' <span class="badge {color}">{st.get("folder_state", "?")}</span></td></tr>'
-                f'<tr><th>In sync</th><td>{in_sync_pct:.1f}% '
-                f'({st.get("folder_local_files", 0)} local / '
-                f'{st.get("folder_global_files", 0)} global files)</td></tr>'
-                f'</table></div>'
-            )
-
-    # Conflicts panel
-    if status["conflicts"]:
-        rows = []
-        for c in status["conflicts"]:
-            rows.append(
-                f"<tr><td>{html_escape(c['id'])}</td>"
-                f"<td>{html_escape(', '.join(c['files']))}</td></tr>"
-            )
-        conflicts_panel = (
-            '<div class="panel"><h2>Conflicts</h2>'
-            "<table><tr><th>ID</th><th>Files</th></tr>"
-            + "".join(rows)
-            + "</table>"
-            '<div style="margin-top:12px;color:var(--muted);">'
-            "Run <code>dotsync resolve</code> in a terminal to resolve."
-            "</div></div>"
-        )
-    else:
-        conflicts_panel = ""
-
-    # Projects
-    projects_html = (
-        "<ul>" + "".join(f"<li>{html_escape(p)}</li>" for p in status["projects"]) + "</ul>"
-        if status["projects"] else '<div class="empty">No projects registered.</div>'
-    )
-
-    # Secrets
-    secrets_html = (
-        "<ul>"
-        + "".join(
-            f"<li><code>{html_escape(s.get('repo_path', '?'))}</code> ← <code>{html_escape(s.get('real_path', '?'))}</code></li>"
-            for s in status["secrets"]
-        )
-        + "</ul>"
-        if status["secrets"]
-        else '<div class="empty">No secrets tracked. Use <code>dotsync track &lt;path&gt;</code>.</div>'
-    )
-
-    # Log
-    log_html = html_escape("\n".join(status["log_tail"])) or "<em>(no log entries yet)</em>"
-
-    return HTML_TEMPLATE.format(
-        service=html_escape(status["service"]),
-        data_dir=html_escape(status["data_dir"]),
-        branch=html_escape(status["branch"]),
-        status_badge=badge,
-        last_sync_html=last_sync_html,
-        daemon=html_escape(status["daemon"]),
-        conflict_count=len(status["conflicts"]),
-        now=html_escape(status["now"]),
-        pause_button=pause_button,
-        peers_html=peers_html,
-        profiles_html=profiles_html,
-        conflicts_panel=conflicts_panel,
-        syncthing_panel=syncthing_panel,
-        projects_html=projects_html,
-        secrets_html=secrets_html,
-        log_html=log_html,
-        version=version,
-    )
+LOGIN_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dotsync — sign in</title>
+<style>
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+    background: #0a0e14; color: #e6e8eb;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh; margin: 0;
+  }
+  form {
+    width: 100%; max-width: 360px; padding: 32px;
+    background: #11161e; border-radius: 10px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.3), 0 0 0 1px #1f2937;
+  }
+  h1 { margin: 0 0 8px; font-size: 22px; font-weight: 600; }
+  p { color: #7a818c; font-size: 13px; margin: 0; }
+  input {
+    width: 100%; padding: 10px 12px; margin: 16px 0 12px;
+    background: #161c25; border: 1px solid #2d3748; border-radius: 6px;
+    color: #e6e8eb; font: inherit; box-sizing: border-box;
+  }
+  input:focus { outline: none; border-color: #7dd3fc; }
+  button {
+    width: 100%; padding: 10px;
+    background: #7dd3fc; border: none; border-radius: 6px;
+    color: #0a0e14; font: inherit; font-weight: 600; cursor: pointer;
+  }
+  button:hover { background: #93dafd; }
+  code {
+    font-family: ui-monospace, "SF Mono", monospace; font-size: 0.92em;
+    background: #161c25; padding: 1px 4px; border-radius: 3px;
+  }
+  .err { color: #fca5a5; font-size: 12px; margin-top: 10px; min-height: 16px; }
+</style>
+</head>
+<body>
+<form id="f">
+  <h1>dotsync</h1>
+  <p>Paste the access token printed by <code>dotsync ui --share</code>, or
+  the contents of <code>~/.dotsync-state/ui-token</code>.</p>
+  <input id="t" type="password" placeholder="token" autocomplete="off" autofocus required>
+  <button type="submit">Sign in</button>
+  <div class="err" id="err"></div>
+</form>
+<script>
+const f = document.getElementById("f");
+const err = document.getElementById("err");
+const params = new URLSearchParams(location.search);
+if (params.get("err") === "1") err.textContent = "Invalid token. Try again.";
+f.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const tok = document.getElementById("t").value.trim();
+  if (!tok) return;
+  localStorage.setItem("dotsync.token", tok);
+  location.href = "/";
+});
+</script>
+</body>
+</html>
+"""
 
 
 # ── HTTP handler ──────────────────────────────────────────────────────
 
 
+def _bin(name: str) -> Path:
+    return tool_dir() / "bin" / name
+
+
+def _run_action(name: str, args: list[str]) -> tuple[bool, str]:
+    """Run a bin/<name> subcommand. Returns (ok, message)."""
+    path = _bin(name)
+    if not path.exists():
+        return False, f"{name}: command not found"
+    try:
+        proc = subprocess.run(
+            [str(path), *args], capture_output=True, text=True, timeout=60
+        )
+    except Exception as e:
+        return False, f"{name}: {e}"
+    if proc.returncode != 0:
+        msg = (proc.stderr or proc.stdout or "").strip().splitlines()
+        return False, msg[-1] if msg else f"{name} exited {proc.returncode}"
+    out = (proc.stdout or "").strip().splitlines()
+    return True, out[-1] if out else f"{name}: ok"
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        # Quieter access log to stderr.
         sys.stderr.write(f"[{self.log_date_time_string()}] {format % args}\n")
 
-    def _serve(self, code: int, body: bytes, content_type: str = "text/html; charset=utf-8"):
+    def _serve(
+        self,
+        code: int,
+        body: bytes,
+        content_type: str = "text/html; charset=utf-8",
+    ) -> None:
         self.send_response(code)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -610,81 +1000,218 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self):
-        cfg = load_config()
+    def _serve_json(self, code: int, payload: dict) -> None:
+        self._serve(code, json.dumps(payload).encode(), "application/json")
+
+    # Auth — loopback bypass + token check for everything else.
+    def _is_loopback(self) -> bool:
+        ip = self.client_address[0]
+        return ip == "::1" or ip.startswith("127.")
+
+    def _present_token(self) -> str:
+        qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+        token = qs.get("token", [""])[0]
+        if not token:
+            token = self.headers.get("X-Dotsync-Token", "")
+        return token
+
+    def _authed(self) -> bool:
+        if not UI_TOKEN:
+            return True  # no token configured (shouldn't happen in main path)
+        if self._is_loopback():
+            return True
+        token = self._present_token()
+        return bool(token) and secrets.compare_digest(token, UI_TOKEN)
+
+    def do_GET(self) -> None:  # noqa: N802
         path = urllib.parse.urlparse(self.path).path
+        if path == "/healthz":
+            self._serve_json(200, {"ok": True, "version": VERSION})
+            return
+        if not self._authed():
+            if path in ("/", ""):
+                self._serve(200, LOGIN_PAGE.encode())
+            else:
+                self._serve_json(401, {"error": "unauthorized"})
+            return
         if path == "/api/status":
-            body = json.dumps(gather_status(cfg)).encode()
-            self._serve(200, body, "application/json")
-        elif path == "/" or path == "":
-            status = gather_status(cfg)
-            body = render_html(status, VERSION).encode()
-            self._serve(200, body)
+            self._serve_json(200, gather_status(load_config()))
+        elif path in ("/", ""):
+            self._serve(200, PAGE.encode())
         else:
             self._serve(404, b"not found", "text/plain")
 
-    def do_POST(self):
+    def do_POST(self) -> None:  # noqa: N802
         path = urllib.parse.urlparse(self.path).path
-        actions = {
-            "/api/sync":   ["env-sync"],
-            "/api/pause":  ["env-pause"],
-            "/api/resume": ["dotsync-resume"],
-        }
-        cmd = actions.get(path)
-        if not cmd:
-            self._serve(404, b"not found", "text/plain")
+        if not self._authed():
+            self._serve_json(401, {"error": "unauthorized"})
             return
-        bin_path = tool_dir() / "bin" / cmd[0]
-        if not bin_path.exists():
-            self._serve(501, f"{cmd[0]} not implemented yet".encode(), "text/plain")
+        if path == "/api/sync":
+            ok, msg = _run_action("env-sync", [])
+        elif path == "/api/pause":
+            ok, msg = _run_action("dotsync-pause", [])
+        elif path == "/api/resume":
+            ok, msg = _run_action("dotsync-resume", [])
+        elif path == "/api/clean-conflicts":
+            ok, msg = _run_action(
+                "dotsync-clean-conflicts", ["--apply", "--merge"]
+            )
+        else:
+            self._serve_json(404, {"error": "unknown action"})
             return
-        # Run async and redirect.
-        try:
-            subprocess.Popen([str(bin_path)] + cmd[1:],
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception as e:
-            self._serve(500, str(e).encode(), "text/plain")
-            return
-        self.send_response(303)
-        self.send_header("Location", "/")
-        self.end_headers()
+        self._serve_json(200 if ok else 500, {"ok": ok, "message": msg})
+
+
+# ── Cloudflared quick tunnel (used by --share) ────────────────────────
+
+
+_TRYCF_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
+
+
+def start_cloudflared(local_url: str, token: str) -> subprocess.Popen | None:
+    """Spawn `cloudflared tunnel --url <local>` and print the public URL.
+
+    Returns the Popen handle, or None if cloudflared is unavailable.
+    The public URL is parsed from cloudflared's stderr stream (where it
+    logs the tunnel hostname); we print it once to the user with the
+    auth token appended so they can open it directly.
+    """
+    if not shutil.which("cloudflared"):
+        print(
+            "⚠  cloudflared not found.\n"
+            "   Install with:  brew install cloudflared\n"
+            "   --share needs it to expose the dashboard via a "
+            "Cloudflare quick tunnel.",
+            file=sys.stderr,
+        )
+        return None
+
+    print("Starting cloudflared quick tunnel…")
+    proc = subprocess.Popen(
+        ["cloudflared", "tunnel", "--no-autoupdate", "--url", local_url],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    printed = threading.Event()
+
+    def reader():
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            if not printed.is_set():
+                m = _TRYCF_RE.search(line)
+                if m:
+                    public = m.group(0)
+                    print()
+                    print(f"  Public URL:  {public}/?token={token}")
+                    print()
+                    print(
+                        "  Open on any device. Ctrl-C here tears the tunnel "
+                        "down."
+                    )
+                    print(
+                        "  Note: quick-tunnel hostnames are ephemeral — "
+                        "expect a new URL on next --share."
+                    )
+                    print()
+                    printed.set()
+            # Surface cloudflared errors so we don't hide a broken tunnel.
+            if "ERR" in line or "FATAL" in line or "level=err" in line.lower():
+                sys.stderr.write(f"[cloudflared] {line}")
+
+    threading.Thread(target=reader, daemon=True).start()
+    return proc
 
 
 # ── Entry ─────────────────────────────────────────────────────────────
 
 
-VERSION = "0.3.0-dev"
-
-
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="dotsync local status dashboard")
     parser.add_argument("--port", type=int, default=7878)
     parser.add_argument("--bind", default="127.0.0.1")
-    parser.add_argument("--no-open", action="store_true",
-                        help="Don't open the browser automatically")
-    parser.add_argument("--background", action="store_true",
-                        help="Run silently (for launchd)")
+    parser.add_argument(
+        "--no-open", action="store_true", help="Don't open the browser automatically"
+    )
+    parser.add_argument(
+        "--background", action="store_true", help="Run silently (for launchd)"
+    )
+    parser.add_argument(
+        "--share",
+        action="store_true",
+        help="Expose dashboard via cloudflared quick tunnel (token-protected)",
+    )
     args = parser.parse_args()
+
+    # Line-buffer stdout so users running with output redirected (launchd,
+    # piped to a file) see "Public URL: ..." immediately when --share runs,
+    # not whenever the block buffer happens to flush.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
+    cfg = load_config()
+    state_dir = Path(cfg["DOTSYNC_STATE_DIR"])
+    global UI_TOKEN
+    UI_TOKEN = load_or_create_token(state_dir)
 
     url = f"http://{args.bind}:{args.port}/"
     if not args.background:
         print(f"Dashboard at {url}")
-        print("Reads existing state files; no new state written.")
+        if args.bind not in ("127.0.0.1", "::1", "localhost"):
+            print(
+                f"  Token (paste at /?token=…):  "
+                f"{UI_TOKEN[:8]}…{UI_TOKEN[-4:]}  "
+                f"(full: {state_dir}/ui-token)"
+            )
         print("Ctrl-C to stop.")
 
-    if not args.no_open and not args.background:
+    cf_proc: subprocess.Popen | None = None
+
+    def cleanup() -> None:
+        if cf_proc is not None and cf_proc.poll() is None:
+            try:
+                cf_proc.terminate()
+                cf_proc.wait(timeout=2)
+            except (subprocess.TimeoutExpired, OSError):
+                try:
+                    cf_proc.kill()
+                except OSError:
+                    pass
+
+    # Cloudflared is a sibling process — it doesn't inherit signals sent
+    # to us. Catch SIGTERM (the default `kill` signal), run cleanup,
+    # then exit. Without this the child outlives the parent.
+    def _on_signal(_signum, _frame):
+        cleanup()
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, _on_signal)
+
+    if args.share:
+        # Quick tunnel always points at 127.0.0.1; the server itself can
+        # stay loopback-bound — cloudflared is the bridge.
+        cf_proc = start_cloudflared(f"http://127.0.0.1:{args.port}", UI_TOKEN)
+
+    if not args.no_open and not args.background and not args.share:
         try:
             webbrowser.open(url)
         except Exception:
             pass
 
     socketserver.TCPServer.allow_reuse_address = True
-    with socketserver.TCPServer((args.bind, args.port), Handler) as httpd:
-        try:
-            httpd.serve_forever()
-        except KeyboardInterrupt:
-            if not args.background:
-                print("\nShutting down.")
+    try:
+        with socketserver.TCPServer((args.bind, args.port), Handler) as httpd:
+            try:
+                httpd.serve_forever()
+            except KeyboardInterrupt:
+                if not args.background:
+                    print("\nShutting down.")
+    finally:
+        cleanup()
 
 
 if __name__ == "__main__":

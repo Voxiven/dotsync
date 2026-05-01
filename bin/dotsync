@@ -18,7 +18,7 @@ _resolve() {
 }
 SCRIPT_DIR="$(_resolve "${BASH_SOURCE[0]}")"
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 
 usage() {
   cat <<EOF
@@ -38,6 +38,7 @@ Daily use:
   doctor              Diagnose common setup issues with remediation hints
   sync                Force a sync now (daemon does this every 60s)
   ui                  Open status dashboard at http://127.0.0.1:7878
+                      ('ui --share' opens a public token-protected URL via cloudflared)
   pause / resume      Halt or restart the sync daemon
   setup-symlinks      Wire symlink-typed profile paths into the Syncthing folder
   no-daemon           Unload our polling daemon (let Syncthing handle sync alone)
