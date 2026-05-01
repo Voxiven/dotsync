@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# dotsync-pause / dotsync-resume — toggle the .sync-paused flag.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_common.sh"
+
+invoked_as="$(basename "$0")"
+mode="${invoked_as#dotsync-}"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  case "$mode" in
+    pause)  cat <<EOF
+dotsync pause — halt the sync daemon.
+
+Creates a marker file at \$DOTSYNC_DATA_DIR/.sync-paused. The daemon
+keeps running but exits cleanly each cycle until you 'dotsync resume'.
+
+Useful before destructive maintenance or when you don't want
+auto-syncs while making large local changes.
+EOF
+            ;;
+    resume) cat <<EOF
+dotsync resume — re-enable the sync daemon.
+
+Removes the .sync-paused marker. The daemon will pick up on its next
+60s tick. Run 'dotsync sync' to trigger one immediately.
+EOF
+            ;;
+  esac
+  exit 0
+fi
+
+case "$mode" in
+  pause)
+    set_paused
+    echo "paused. Run 'dotsync resume' to re-enable."
+    ;;
+  resume)
+    if ! is_paused; then
+      echo "not paused — nothing to do"
+      exit 0
+    fi
+    clear_paused
+    echo "resumed. Daemon picks up on next tick (or run: dotsync sync)"
+    ;;
+  *)
+    die "must be invoked as dotsync-pause or dotsync-resume"
+    ;;
+esac

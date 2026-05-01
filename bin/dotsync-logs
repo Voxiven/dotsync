@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# dotsync-logs — show or tail the sync log.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_common.sh"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<EOF
+dotsync logs — view the sync log.
+
+Usage: dotsync logs [--tail] [-n N]
+
+Options:
+  --tail     Follow the log (like tail -f). Ctrl-C to exit.
+  -n N       Show last N lines (default: 50).
+EOF
+  exit 0
+fi
+
+[[ -f "$ENV_LOG_FILE" ]] || die "no log at $ENV_LOG_FILE — sync hasn't run yet"
+
+tail_mode=false
+n=50
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --tail|-f) tail_mode=true; shift ;;
+    -n)        n="$2"; shift 2 ;;
+    *)         die "unknown flag: $1" ;;
+  esac
+done
+
+if $tail_mode; then
+  exec tail -F "$ENV_LOG_FILE"
+else
+  tail -n "$n" "$ENV_LOG_FILE"
+fi

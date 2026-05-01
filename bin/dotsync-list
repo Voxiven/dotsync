@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# dotsync-list — show everything tracked, by profile.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOL_DIR="$(dirname "$SCRIPT_DIR")"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_common.sh"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<EOF
+dotsync list — show what's being synced.
+
+Usage: dotsync list
+
+Sections:
+  - Enabled profiles + their declared paths
+  - Ad-hoc tracked items (from the registry)
+  - Registered projects
+EOF
+  exit 0
+fi
+
+# Enabled profiles.
+ENABLED_FILE="$DOTSYNC_DATA_DIR/registry/enabled-profiles.json"
+enabled=""
+if [[ -f "$ENABLED_FILE" ]]; then
+  enabled=$(jq -r '.profiles[]? // empty' "$ENABLED_FILE" | tr '\n' ' ')
+fi
+
+PROFILES_DIR="$TOOL_DIR/profiles"
+
+if [[ -n "$enabled" ]]; then
+  printf '\n\033[1mEnabled profiles\033[0m\n'
+  for name in $enabled; do
+    pf="$PROFILES_DIR/$name.json"
+    if [[ -f "$pf" ]]; then
+      desc=$(jq -r '.description' "$pf")
+      printf '\n  %s — %s\n' "$name" "$desc"
+      jq -r '.paths[]? | "    [\(.type)] \(.from // .real // "?") → \(.to // .shared // "?")"' "$pf"
+    else
+      printf '\n  %s (profile file missing)\n' "$name"
+    fi
+  done
+else
+  printf '\n\033[1mEnabled profiles\033[0m\n  (none — try: dotsync enable claude-code)\n'
+fi
+
+# Ad-hoc tracked items.
+SECRETS_FILE="$DOTSYNC_DATA_DIR/registry/secrets.json"
+if [[ -f "$SECRETS_FILE" ]]; then
+  count=$(jq -r '.secrets | length' "$SECRETS_FILE" 2>/dev/null)
+  printf '\n\033[1mAd-hoc tracked items (%s)\033[0m\n' "$count"
+  if [[ "$count" -gt 0 ]]; then
+    jq -r '.secrets[] | "  \(.repo_path)  ←  \(.real_path)"' "$SECRETS_FILE"
+  else
+    printf '  (none — try: dotsync track <path>)\n'
+  fi
+fi
+
+# Projects.
+PROJECTS_FILE="$DOTSYNC_DATA_DIR/registry/projects.json"
+if [[ -f "$PROJECTS_FILE" ]]; then
+  count=$(jq -r '.projects | length' "$PROJECTS_FILE" 2>/dev/null)
+  printf '\n\033[1mRegistered projects (%s)\033[0m\n' "$count"
+  jq -r '.projects[] | "  \(.name)\(if .label and .label != .name then " — \(.label)" else "" end)"' "$PROJECTS_FILE"
+fi
+
+echo

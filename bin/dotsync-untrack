@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# dotsync-untrack — unregister a tracked path. Doesn't delete the file
+# from disk; just removes it from the sync registry.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_common.sh"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<EOF
+dotsync untrack — remove a path from the sync registry.
+
+Usage: dotsync untrack <pattern>
+
+The pattern matches against either repo_path or real_path (substring).
+The file on disk is NOT deleted. The repo copy is also kept (run a
+manual git rm if you want to purge it from the data repo).
+EOF
+  exit 0
+fi
+
+[[ $# -lt 1 ]] && die "untrack requires a pattern"
+pattern="$1"
+
+reg="$DOTSYNC_DATA_DIR/registry/secrets.json"
+[[ -f "$reg" ]] || die "no registry at $reg (have you run 'dotsync init'?)"
+
+# Show what will be removed.
+matches=$(jq --arg p "$pattern" '.secrets | map(select(.repo_path | contains($p)) // select(.real_path | contains($p)))' "$reg")
+count=$(echo "$matches" | jq 'length')
+
+if [[ "$count" -eq 0 ]]; then
+  echo "no entries match '$pattern'"
+  exit 0
+fi
+
+echo "Removing $count entry/entries:"
+echo "$matches" | jq -r '.[] | "  \(.repo_path)  ←  \(.real_path)"'
+
+tmp="$(mktemp)"
+jq --arg p "$pattern" '
+  .secrets = (.secrets | map(select(
+    (.repo_path | contains($p) | not) and
+    (.real_path | contains($p) | not)
+  )))
+' "$reg" > "$tmp" && mv "$tmp" "$reg"
+
+echo
+echo "untracked. The file on disk is unchanged."
+echo "(run 'git rm' in $DOTSYNC_DATA_DIR if you want to purge from the repo too)"

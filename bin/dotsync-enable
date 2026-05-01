@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# dotsync-enable / dotsync-disable — toggle a profile in enabled-profiles.json.
+# The dispatcher routes both names to this script (via a symlink).
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOL_DIR="$(dirname "$SCRIPT_DIR")"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_common.sh"
+
+invoked_as="$(basename "$0")"
+mode="${invoked_as#dotsync-}"   # "enable" or "disable"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<EOF
+dotsync $mode — turn a profile on/off in this dotsync setup.
+
+Usage: dotsync $mode <profile-name>
+
+Available profiles: see 'dotsync profiles'.
+
+Changes are written to \$DOTSYNC_DATA_DIR/registry/enabled-profiles.json
+and pick up on the next sync cycle. The change syncs to other machines.
+EOF
+  exit 0
+fi
+
+[[ $# -lt 1 ]] && die "$mode requires a profile name (try 'dotsync profiles')"
+name="$1"
+
+PROFILE_FILE="$TOOL_DIR/profiles/$name.json"
+[[ -f "$PROFILE_FILE" ]] || die "no such profile: $name (see 'dotsync profiles')"
+
+ENABLED_FILE="$DOTSYNC_DATA_DIR/registry/enabled-profiles.json"
+mkdir -p "$(dirname "$ENABLED_FILE")"
+[[ -f "$ENABLED_FILE" ]] || echo '{"profiles":[]}' > "$ENABLED_FILE"
+
+tmp="$(mktemp)"
+case "$mode" in
+  enable)
+    jq --arg n "$name" '
+      if any(.profiles[]?; . == $n) then .
+      else .profiles += [$n] end
+    ' "$ENABLED_FILE" > "$tmp"
+    ;;
+  disable)
+    jq --arg n "$name" '
+      .profiles = (.profiles - [$n])
+    ' "$ENABLED_FILE" > "$tmp"
+    ;;
+  *)
+    die "unknown mode: $mode (script must be invoked as dotsync-enable or dotsync-disable)"
+    ;;
+esac
+
+mv "$tmp" "$ENABLED_FILE"
+echo "$mode: $name"

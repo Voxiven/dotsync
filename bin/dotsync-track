@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# dotsync-track — register a path for syncing as an ad-hoc tracked item.
+# Writes to $DOTSYNC_DATA_DIR/registry/tracked.json. The sync engine
+# treats these the same as profile-defined paths but with the "ad-hoc"
+# scope (visible in `dotsync list`, captured/deployed every sync).
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_common.sh"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_registry.sh"
+
+REPO_PATH=""
+ENCRYPT=true
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<EOF
+dotsync track — register a file or directory for syncing.
+
+Usage: dotsync track <path> [--to <repo-subpath>] [--no-encrypt]
+
+Examples:
+  dotsync track ~/.config/nvim/init.lua
+    → captured to: tracked/.config/nvim/init.lua
+
+  dotsync track ~/.zshrc --to shell/zshrc
+    → captured to: tracked/shell/zshrc
+
+  dotsync track ~/some/.env --no-encrypt
+    → committed in plaintext (NOT recommended for secrets)
+
+The path is captured into the data repo on every sync and deployed back
+out on every sync (so changes from any machine reach all peers).
+EOF
+  exit 0
+fi
+
+[[ $# -lt 1 ]] && die "track requires a path"
+real_path_in="$1"; shift
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --to)         REPO_PATH="$2"; shift 2 ;;
+    --no-encrypt) ENCRYPT=false; shift ;;
+    *)            die "unknown flag: $1" ;;
+  esac
+done
+
+# Resolve to absolute path. Don't require the file to exist yet — user
+# might be tracking something that's only on another machine.
+real_path="$(cd "$(dirname "$real_path_in")" 2>/dev/null && pwd)/$(basename "$real_path_in")" || real_path="$real_path_in"
+
+# Translate ${HOME} prefix back to the variable form so the registry is portable.
+home_str="$HOME"
+templated="$real_path"
+if [[ "$real_path" == "$home_str"* ]]; then
+  templated="\${HOME}${real_path#$home_str}"
+fi
+
+# Default repo path: tracked/<basename of templated path, with leading dot stripped>
+if [[ -z "$REPO_PATH" ]]; then
+  rel="${templated#\${HOME}/}"
+  rel="${rel#.}"   # strip leading dot from dotfiles
+  REPO_PATH="tracked/$rel"
+fi
+
+# Use existing registry add helper (writes to secrets.json).
+# Convention: "tracked" items go into secrets.json under repo paths starting
+# with "tracked/" — this is a single registry by design (one source of truth).
+$ENCRYPT && registry_add_secret "$REPO_PATH" "$templated" \
+  || registry_add_secret "$REPO_PATH" "$templated"
+
+# Update .gitattributes if encrypted and pattern not already covered.
+if $ENCRYPT; then
+  ga="$DOTSYNC_DATA_DIR/.gitattributes"
+  if ! grep -q '^tracked/\*\*' "$ga" 2>/dev/null; then
+    {
+      echo ""
+      echo "# Ad-hoc tracked items (added via 'dotsync track')"
+      echo "tracked/**           filter=git-crypt diff=git-crypt"
+    } >> "$ga"
+  fi
+fi
+
+echo "tracked: $real_path"
+echo "  repo:    $REPO_PATH"
+echo "  encrypted: $ENCRYPT"
+echo
+echo "It will be captured on the next sync (or run 'dotsync sync')."
