@@ -51,18 +51,23 @@ done
 # might be tracking something that's only on another machine.
 real_path="$(cd "$(dirname "$real_path_in")" 2>/dev/null && pwd)/$(basename "$real_path_in")" || real_path="$real_path_in"
 
-# Translate ${HOME} prefix back to the variable form so the registry is portable.
+# Translate ${HOME} prefix back to the variable form so the registry is
+# portable across machines with different usernames.
 home_str="$HOME"
 templated="$real_path"
-if [[ "$real_path" == "$home_str"* ]]; then
-  templated="\${HOME}${real_path#$home_str}"
+if [[ "$real_path" == "$home_str"/* ]]; then
+  # Build the templated string without bash trying to interpolate ${HOME}
+  # later — store as the literal 5-character sequence "${HOME}".
+  templated='${HOME}'"${real_path#$home_str}"
 fi
 
-# Default repo path: tracked/<basename of templated path, with leading dot stripped>
+# Default repo path: tracked/<basename, leading dot stripped>.
+# Avoid relying on the templated form here — the literal "${HOME}" string
+# would be re-interpreted by bash. Just use basename.
 if [[ -z "$REPO_PATH" ]]; then
-  rel="${templated#\${HOME}/}"
-  rel="${rel#.}"   # strip leading dot from dotfiles
-  REPO_PATH="tracked/$rel"
+  base="$(basename "$real_path")"
+  base="${base#.}"   # strip leading dot from dotfiles
+  REPO_PATH="tracked/$base"
 fi
 
 # Use existing registry add helper (writes to secrets.json).
