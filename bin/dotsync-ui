@@ -127,6 +127,30 @@ def _st_call(cfg: dict, path: str) -> dict | list | None:
         return None
 
 
+def _classify_connection(c: dict) -> str:
+    """Map a Syncthing connection record to one of:
+       lan      — direct, peer is on the same broadcast LAN
+       wan      — direct, peer is on a different network (NAT-punched)
+       relay    — going through a Syncthing public relay (encrypted)
+       offline  — no current connection
+
+    The Syncthing /rest/system/connections endpoint returns per-peer:
+      connected: bool
+      type: "tcp-server" | "tcp-client" | "quic-server" | "quic-client" |
+            "relay-server" | "relay-client" | ...
+      isLocal: bool (peer's address is RFC1918 / link-local)
+    Direct vs relayed is in `type`; LAN vs WAN is in `isLocal`.
+    """
+    if not c.get("connected"):
+        return "offline"
+    conn_type = (c.get("type") or "").lower()
+    if "relay" in conn_type:
+        return "relay"
+    if c.get("isLocal"):
+        return "lan"
+    return "wan"
+
+
 def gather_syncthing(cfg: dict) -> dict:
     sys_status = _st_call(cfg, "/rest/system/status")
     if not sys_status:
@@ -156,6 +180,7 @@ def gather_syncthing(cfg: dict) -> dict:
             "address": c.get("address", ""),
             "in_bytes": c.get("inBytesTotal", 0),
             "out_bytes": c.get("outBytesTotal", 0),
+            "connection_kind": _classify_connection(c),
         })
 
     global_bytes = max(folder_status.get("globalBytes", 1) or 1, 1)
@@ -745,16 +770,30 @@ function render(s) {
 
   // Peer table
   if (peers.length) {
+    const kindLabel = {
+      lan:     ["Direct LAN",  "good"],
+      wan:     ["Direct WAN",  "good"],
+      relay:   ["Relayed",     "info"],
+      offline: ["Offline",     "bad"],
+    };
     $("peerList").innerHTML =
-      "<table><tr><th>Machine</th><th>Status</th><th>Address</th><th>Traffic</th></tr>" +
-      peers.map(p =>
-        "<tr><td><code>" + escape(p.name) + "</code></td>" +
-        "<td><span class='pill " + (p.connected ? "good" : "bad") + "'>" +
-          "<span class='dot'></span>" + (p.connected ? "connected" : "offline") +
-        "</span></td>" +
-        "<td class='mono'>" + escape(p.address || "—") + "</td>" +
-        "<td class='mono'>↑ " + fmtBytes(p.out_bytes) + " / ↓ " + fmtBytes(p.in_bytes) + "</td></tr>"
-      ).join("") + "</table>";
+      "<table><tr><th>Machine</th><th>Link</th><th>Address</th><th>Traffic</th></tr>" +
+      peers.map(p => {
+        const [label, cls] = kindLabel[p.connection_kind] || ["—", "bad"];
+        return "<tr><td><code>" + escape(p.name) + "</code></td>" +
+          "<td><span class='pill " + cls + "' title='" +
+            (p.connection_kind === "relay"
+              ? "Going through a Syncthing public relay (encrypted). Direct connect failed — likely a NAT or firewall."
+              : p.connection_kind === "wan"
+              ? "Direct peer-to-peer across networks (NAT-punched)."
+              : p.connection_kind === "lan"
+              ? "Direct peer-to-peer on the same local network."
+              : "No active connection.") + "'>" +
+            "<span class='dot'></span>" + label +
+          "</span></td>" +
+          "<td class='mono'>" + escape(p.address || "—") + "</td>" +
+          "<td class='mono'>↑ " + fmtBytes(p.out_bytes) + " / ↓ " + fmtBytes(p.in_bytes) + "</td></tr>";
+      }).join("") + "</table>";
   } else {
     $("peerList").innerHTML = stRunning
       ? '<div class="empty">No peers paired. Run <code>dotsync pair</code> to add one.</div>'
@@ -1180,6 +1219,39 @@ def uninstall_ui_agent() -> int:
 _TRYCF_RE = re.compile(r"https://[a-z0-9-]+\.trycloudflare\.com")
 
 
+def _publish_mdns(port: int) -> subprocess.Popen | None:
+    """Register dotsync.local → 127.0.0.1 via macOS mDNS (Bonjour).
+
+    Spawns `dns-sd -P` in the background. The registration lives as long
+    as the process does, so launchd's KeepAlive keeps dotsync.local
+    alive across crashes/restarts.
+
+    `dns-sd -P` arguments:
+      <name>     service instance name (visible to network browsers)
+      <type>     service type — _http._tcp for a web service
+      <domain>   "local" — the mDNS multicast domain
+      <port>     port the service is on
+      <host>     hostname to register an A record for
+      <addr>     IPv4 address that hostname resolves to
+    """
+    if not shutil.which("dns-sd"):
+        return None
+    try:
+        return subprocess.Popen(
+            [
+                "dns-sd", "-P",
+                "dotsync", "_http._tcp", "local",
+                str(port),
+                "dotsync.local", "127.0.0.1",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        return None
+
+
 def start_cloudflared(local_url: str, token: str) -> subprocess.Popen | None:
     """Spawn `cloudflared tunnel --url <local>` and print the public URL.
 
@@ -1299,26 +1371,40 @@ def main() -> None:
         print("Ctrl-C to stop.")
 
     cf_proc: subprocess.Popen | None = None
+    mdns_proc: subprocess.Popen | None = None
 
     def cleanup() -> None:
-        if cf_proc is not None and cf_proc.poll() is None:
+        for proc in (cf_proc, mdns_proc):
+            if proc is None or proc.poll() is not None:
+                continue
             try:
-                cf_proc.terminate()
-                cf_proc.wait(timeout=2)
+                proc.terminate()
+                proc.wait(timeout=2)
             except (subprocess.TimeoutExpired, OSError):
                 try:
-                    cf_proc.kill()
+                    proc.kill()
                 except OSError:
                     pass
 
-    # Cloudflared is a sibling process — it doesn't inherit signals sent
-    # to us. Catch SIGTERM (the default `kill` signal), run cleanup,
-    # then exit. Without this the child outlives the parent.
+    # Sibling subprocesses — they don't inherit signals sent to us.
+    # Catch SIGTERM (the default `kill` signal), run cleanup, then exit.
+    # Without this the children outlive the parent.
     def _on_signal(_signum, _frame):
         cleanup()
         os._exit(0)
 
     signal.signal(signal.SIGTERM, _on_signal)
+
+    # Publish dotsync.local via macOS mDNS so the dashboard is reachable
+    # at http://dotsync.local:<port>/ in any browser, no /etc/hosts edit
+    # or sudo. dns-sd -P registers an mDNS service AND a hostname A
+    # record pointing at 127.0.0.1 — each machine resolves dotsync.local
+    # to its own loopback, so multi-machine setups don't cross over.
+    # Silent fallback if dns-sd isn't on PATH (very old macOS, or Linux
+    # support down the line).
+    mdns_proc = _publish_mdns(args.port)
+    if not args.background and mdns_proc is not None:
+        print(f"  also at:  http://dotsync.local:{args.port}/")
 
     if args.share:
         # Quick tunnel always points at 127.0.0.1; the server itself can

@@ -59,6 +59,7 @@ check() {
   local level="$1" name="$2" msg="$3" hint="${4:-}"
   case "$level" in
     PASS) PASS=$((PASS+1)); $JSON || printf '  ✓ %-32s %s\n' "$name" "$msg" ;;
+    INFO) $JSON || printf '  • %-32s %s\n' "$name" "$msg" ;;
     WARN) WARN=$((WARN+1));
           if $JSON; then :; else
             printf '  ⚠ %-32s %s\n' "$name" "$msg"
@@ -206,6 +207,53 @@ if st_running; then
     else
       check WARN "NAT traversal" "disabled" \
         "in Syncthing UI: Settings → Connections → Enable NAT Traversal"
+    fi
+
+    # Active reachability probes — config flags above only confirm
+    # Syncthing INTENDS to use these paths. These check the network
+    # actually permits them right now. Each probe is short-timeout so
+    # doctor stays fast even on flaky networks.
+    if command -v nc >/dev/null 2>&1; then
+      # Public relay TCP reachability. Syncthing's relay pool is on
+      # multiple ports; relays.syncthing.net:443 is the canonical
+      # always-on entry. If this fails, the user's firewall/ISP is
+      # blocking outbound — relays won't work, cross-network sync
+      # falls back to direct-only and may not punch through.
+      if nc -z -G 4 relays.syncthing.net 443 2>/dev/null; then
+        check PASS "relay reachability" "TCP 443 → relays.syncthing.net OK"
+      else
+        check WARN "relay reachability" "cannot reach relays.syncthing.net:443" \
+          "your network blocks outbound to Syncthing relays — cross-network sync may fail when both peers are behind NAT"
+      fi
+    fi
+
+    # Global discovery DNS — does the announce server name resolve?
+    # If this fails the peers can't find each other when on different
+    # networks (LAN-only mode would still work).
+    if command -v dig >/dev/null 2>&1; then
+      if dig +short +time=2 +tries=1 discovery.syncthing.net >/dev/null 2>&1 \
+         && [[ -n "$(dig +short +time=2 +tries=1 discovery.syncthing.net)" ]]; then
+        check PASS "discovery resolution" "discovery.syncthing.net resolves"
+      else
+        check WARN "discovery resolution" "cannot resolve discovery.syncthing.net" \
+          "your DNS resolver may be blocking it — cross-network peer discovery will fail"
+      fi
+    fi
+
+    # Connection types in use right now — gives a one-line answer to
+    # "is this peer reachable across networks". Pulls live state.
+    conn_resp=$(_st_curl GET "/rest/system/connections" 2>/dev/null || true)
+    if [[ -n "$conn_resp" ]]; then
+      kinds=$(echo "$conn_resp" | jq -r '
+        .connections | to_entries[]
+        | select(.value.connected == true)
+        | if (.value.type | ascii_downcase | contains("relay")) then "relay"
+          elif .value.isLocal then "lan"
+          else "wan" end
+      ' 2>/dev/null | sort -u | tr "\n" " " | sed "s/ $//")
+      if [[ -n "$kinds" ]]; then
+        check INFO "current peer link(s)" "$kinds"
+      fi
     fi
   fi
 
