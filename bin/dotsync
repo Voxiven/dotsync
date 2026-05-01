@@ -27,6 +27,8 @@ Daily use:
   sync                Force a sync now (daemon usually does this every 60s)
   ui                  Open status dashboard at http://127.0.0.1:7878
   pause / resume      Halt or restart the sync daemon
+  setup-symlinks      Wire symlink-typed profile paths into the Syncthing folder
+  no-daemon           Unload our polling daemon (Syncthing handles sync directly)
 
 Profiles (per-tool sync configurations):
   profiles            List available + enabled profiles

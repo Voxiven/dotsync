@@ -274,13 +274,23 @@ tmp=$(mktemp)
 mv "$tmp" "$DOTSYNC_CONFIG"
 say "set DOTSYNC_ENGINE=syncthing"
 
-# 7. Reload our launchd agent.
+# 7a. Wire symlinks (Phase 4.7) — the symlink_* path types in the
+# claude-code profile become real symlinks here, eliminating capture/
+# deploy work for those paths. CC writes through them directly.
+step "Wiring symlinks into the Syncthing folder"
+DOTSYNC_ENGINE="syncthing" \
+SYNCTHING_FOLDER_ID="$FOLDER_ID" \
+SYNCTHING_API_BASE="$ST_API_BASE" \
+"$SCRIPT_DIR/dotsync-setup-symlinks" 2>&1 | sed 's/^/  /' || \
+  say "(setup-symlinks had warnings; check 'dotsync logs')"
+
+# 7b. Reload our launchd agent.
 step "Reloading dotsync launchd agent"
 plist="$HOME/Library/LaunchAgents/$DOTSYNC_KC_SERVICE.plist"
 if [[ -f "$plist" ]]; then
   launchctl unload "$plist" 2>/dev/null || true
   launchctl load -w "$plist" || die "launchctl load failed"
-  say "reloaded — daemon is now in syncthing mode"
+  say "reloaded — daemon is now in syncthing mode (mostly idle: most paths are symlinked)"
 fi
 
 # 8. Done.

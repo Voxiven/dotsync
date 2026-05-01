@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# dotsync-setup-symlinks — wire up symlink-typed profile paths.
+#
+# Idempotent: re-running is a no-op if symlinks are already correct.
+# Migrates regular files/dirs at the symlink locations into the
+# Syncthing folder, then replaces them with symlinks.
+#
+# Use cases:
+#   - After enabling a new profile, before next sync, to set up the
+#     symlinks immediately
+#   - After 'dotsync upgrade' to convert a v0.3 setup's regular files
+#     into symlinks
+#   - On any sync cycle (the engine calls profile_run_all capture which
+#     handles symlink_file / symlink_directory the same way)
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_common.sh"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_registry.sh"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_profile.sh"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<EOF
+dotsync setup-symlinks — wire symlink-typed profile paths into the Syncthing folder.
+
+Usage: dotsync setup-symlinks [--profile <name>] [--dry-run]
+
+Options:
+  --profile <name>   Only set up symlinks for one profile (default: all enabled).
+  --dry-run          Show what would be done; don't touch the filesystem.
+
+Reads enabled-profiles.json. For each profile, calls 'capture' on every
+path entry — symlink_file / symlink_directory entries become idempotent
+symlink-wiring operations; other types do their normal capture work.
+
+Migration: if a real file/dir exists at the symlink location (e.g. from a
+v0.3 setup or before enabling this profile), its contents are moved into
+the Syncthing folder before being replaced with a symlink.
+EOF
+  exit 0
+fi
+
+ONLY_PROFILE=""
+DRY_RUN=false
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --profile) ONLY_PROFILE="$2"; shift 2 ;;
+    --dry-run) DRY_RUN=true; shift ;;
+    *)         die "unknown flag: $1" ;;
+  esac
+done
+
+if ! profile_mode_active; then
+  die "profile mode is not active (no enabled-profiles.json) — run 'dotsync enable <profile>' first"
+fi
+
+if [[ "${DOTSYNC_ENGINE:-git}" != "syncthing" ]]; then
+  log_warn "engine is '${DOTSYNC_ENGINE:-git}', not 'syncthing'."
+  log_warn "Symlink wiring is intended for syncthing mode — proceeding anyway, but git mode races between rebase and live writers will return."
+fi
+
+if $DRY_RUN; then
+  echo "Would set up symlinks for profiles:"
+  if [[ -n "$ONLY_PROFILE" ]]; then
+    echo "  $ONLY_PROFILE"
+  else
+    enabled_profiles | sed 's/^/  /'
+  fi
+  exit 0
+fi
+
+if [[ -n "$ONLY_PROFILE" ]]; then
+  log_info "wiring symlinks for profile: $ONLY_PROFILE"
+  profile_run "$ONLY_PROFILE" capture
+else
+  log_info "wiring symlinks for all enabled profiles: $(enabled_profiles | tr '\n' ' ')"
+  profile_run_all capture
+fi
+
+echo "✓ symlinks wired"

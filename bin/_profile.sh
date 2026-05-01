@@ -78,20 +78,33 @@ profile_run() {
   iterates="$(jq -r '.iterates_per_project // false' "$pf")"
 
   if [[ "$iterates" == "true" ]]; then
-    local proj
     local projects_file="$ENV_REPO_ROOT/registry/projects.json"
-    [[ -f "$projects_file" ]] || { _profile_run_paths "$name" "$pf" "$action" ""; return; }
-    while IFS= read -r proj; do
-      [[ -z "$proj" ]] && continue
-      _profile_run_paths "$name" "$pf" "$action" "$proj"
-    done < <(jq -r '.projects[]?.name // empty' "$projects_file")
+    local project_count=0
+    if [[ -f "$projects_file" ]]; then
+      project_count=$(jq -r '.projects | length' "$projects_file" 2>/dev/null || echo 0)
+    fi
+
+    # ALWAYS run paths that don't reference ${PROJECT}/${CC_ENCODED} —
+    # those are tool-global (settings.json, CLAUDE.md, agents/, etc.).
+    # We pass an empty project; templates that DO use ${PROJECT} will
+    # render to invalid paths and the type handlers skip them.
+    _profile_run_paths "$name" "$pf" "$action" "" "non-per-project"
+
+    # Then iterate the per-project paths once per registered project.
+    if [[ "$project_count" -gt 0 ]]; then
+      local proj
+      while IFS= read -r proj; do
+        [[ -z "$proj" ]] && continue
+        _profile_run_paths "$name" "$pf" "$action" "$proj" "per-project"
+      done < <(jq -r '.projects[]?.name // empty' "$projects_file")
+    fi
   else
     _profile_run_paths "$name" "$pf" "$action" ""
   fi
 }
 
 _profile_run_paths() {
-  local name="$1" pf="$2" action="$3" project="$4"
+  local name="$1" pf="$2" action="$3" project="$4" mode="${5:-all}"
 
   local n i entry type from to real shared skip_empty skip_missing
   n=$(jq '.paths | length' "$pf")
@@ -104,6 +117,19 @@ _profile_run_paths() {
     shared=$(echo "$entry" | jq -r '.shared // empty')
     skip_empty=$(echo "$entry" | jq -r '.skip_if_empty // false')
     skip_missing=$(echo "$entry" | jq -r '.skip_if_missing // false')
+
+    # Determine if this path entry references the project (uses
+    # ${PROJECT} or ${CC_ENCODED} in any template). Used to gate
+    # iteration when iterates_per_project=true.
+    local entry_raw="$from $to $real $shared"
+    local is_per_project="false"
+    [[ "$entry_raw" == *'${PROJECT}'* || "$entry_raw" == *'${CC_ENCODED}'* ]] && is_per_project="true"
+
+    case "$mode" in
+      non-per-project) [[ "$is_per_project" == "true" ]] && continue ;;
+      per-project)     [[ "$is_per_project" == "false" ]] && continue ;;
+      all)             ;;  # run everything
+    esac
 
     [[ -n "$from"   ]] && from="$(_expand_template "$from" "$project")"
     [[ -n "$to"     ]] && to="$(_expand_template "$to" "$project")"
@@ -123,6 +149,16 @@ _profile_run_paths() {
         ;;
       shared_per_project_symlink)
         _profile_path_shared_symlink "$action" "$real" "$shared"
+        ;;
+      symlink_file)
+        # Real file at $from is a symlink to $repo/$to. Daemon-less:
+        # CC writes through the symlink directly into the Syncthing folder.
+        _profile_path_symlink_file "$action" "$from" "$to"
+        ;;
+      symlink_directory)
+        # Real dir at $from is a symlink to $repo/$to. CC writes through.
+        # Use for whole-tree replication (e.g. ~/.claude/agents/, project dirs).
+        _profile_path_symlink_directory "$action" "$from" "$to"
         ;;
       *)
         log_warn "unknown path type: $type (profile=$name id=$(echo "$entry" | jq -r '.id // "?"'))"
@@ -208,6 +244,91 @@ _profile_path_session_jsonls() {
       mkdir -p "${from%/}"
       rsync -a --checksum --include='*.jsonl' --exclude='*' \
         "${repo_full%/}/" "${from%/}/"
+      ;;
+  esac
+}
+
+_profile_path_symlink_file() {
+  # In syncthing engine, CC writes through a symlink directly into the
+  # Syncthing folder. capture/deploy is "ensure the symlink is correct"
+  # — idempotent on subsequent calls, no content copy.
+  #
+  # Migration: if $from is currently a regular file (e.g. v0.3 setup),
+  # move its content to $repo_full and replace with a symlink.
+  local action="$1" from="$2" to="$3"
+  local repo_full="$ENV_REPO_ROOT/$to"
+
+  case "$action" in
+    capture|deploy)
+      mkdir -p "$(dirname "$repo_full")"
+      mkdir -p "$(dirname "$from")"
+
+      # Already the right symlink? Done.
+      if [[ -L "$from" ]]; then
+        local target; target="$(readlink "$from")"
+        if [[ "$target" == "$repo_full" ]]; then
+          # Ensure the target file exists (so reads don't fail).
+          [[ -e "$repo_full" ]] || touch "$repo_full"
+          return 0
+        fi
+        # Symlink points elsewhere — replace.
+        rm "$from"
+      elif [[ -f "$from" ]]; then
+        # Real file: migrate content into the Syncthing folder if repo
+        # doesn't already have it.
+        if [[ -s "$from" && ! -s "$repo_full" ]]; then
+          cp "$from" "$repo_full"
+        fi
+        rm "$from"
+      elif [[ -e "$from" ]]; then
+        log_warn "cannot symlink: $from exists but is not a file or symlink"
+        return 1
+      fi
+
+      # Ensure the target exists, then create the symlink.
+      [[ -e "$repo_full" ]] || touch "$repo_full"
+      ln -s "$repo_full" "$from"
+      ;;
+  esac
+}
+
+_profile_path_symlink_directory() {
+  # Same as symlink_file, but for whole directories. Use for
+  # ~/.claude/agents/, ~/.claude/commands/, and per-project dirs.
+  #
+  # Migration: if $from is currently a real dir, rsync its contents
+  # into $repo_full (preserving any existing peer content), then remove
+  # $from and replace with a symlink.
+  local action="$1" from="$2" to="$3"
+  local repo_full="$ENV_REPO_ROOT/$to"
+  from="${from%/}"
+  repo_full="${repo_full%/}"
+
+  case "$action" in
+    capture|deploy)
+      mkdir -p "$(dirname "$repo_full")"
+      mkdir -p "$(dirname "$from")"
+
+      if [[ -L "$from" ]]; then
+        local target; target="$(readlink "$from")"
+        if [[ "$target" == "$repo_full" ]]; then
+          mkdir -p "$repo_full"
+          return 0
+        fi
+        rm "$from"
+      elif [[ -d "$from" ]]; then
+        # Real dir: merge contents into the Syncthing folder (peer
+        # content takes precedence on overlap; rsync without --delete).
+        mkdir -p "$repo_full"
+        rsync -a "$from/" "$repo_full/"
+        rm -rf "$from"
+      elif [[ -e "$from" ]]; then
+        log_warn "cannot symlink: $from exists but is not a directory or symlink"
+        return 1
+      fi
+
+      mkdir -p "$repo_full"
+      ln -s "$repo_full" "$from"
       ;;
   esac
 }

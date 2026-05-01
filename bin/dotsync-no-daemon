@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# dotsync-no-daemon — unload the dotsync polling daemon.
+#
+# In syncthing mode with everything symlinked, our launchd cron has
+# nothing left to do — Syncthing's own daemon handles all replication,
+# symlinks bridge CC's paths into the Syncthing folder. This command
+# unloads our agent so only Syncthing runs.
+#
+# Inverse: 'dotsync daemon' (or 'dotsync upgrade' / 'dotsync init')
+# re-installs and loads the agent.
+#
+# Use this when:
+#   - You're on syncthing engine
+#   - All your enabled profiles use only symlink_* / shared_per_project_symlink
+#     path types (no session_jsonls, no plain file/directory captures, no
+#     ad-hoc tracked secrets)
+#   - You don't need the periodic safety-net sync
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_common.sh"
+
+ACTION="off"
+FORCE=false
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<EOF
+dotsync no-daemon — disable the dotsync polling agent (syncthing mode).
+
+Usage: dotsync no-daemon [--check] [--force]
+
+Options:
+  --check    Don't disable — just report whether your setup is safe to
+             run daemonless (i.e., all enabled profiles are symlink-only,
+             no ad-hoc tracked items).
+  --force    Skip the safety check and unload anyway.
+
+What it does:
+  1. Checks your config + profiles for paths that still need cp-based
+     capture/deploy. If found, errors out (use --force to override).
+  2. Unloads ~/Library/LaunchAgents/\$DOTSYNC_KC_SERVICE.plist.
+  3. Removes the plist.
+
+Reverse: dotsync upgrade (or dotsync init) re-installs the daemon.
+
+Note: Syncthing's own daemon (managed by 'brew services') keeps running
+and handles all file replication. This command only stops dotsync's
+polling cron.
+EOF
+  exit 0
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --check) ACTION="check"; shift ;;
+    --force) FORCE=true; shift ;;
+    *)       die "unknown flag: $1" ;;
+  esac
+done
+
+# ── Safety check ────────────────────────────────────────────────────
+needs_daemon=false
+reasons=()
+
+if [[ "${DOTSYNC_ENGINE:-git}" != "syncthing" ]]; then
+  needs_daemon=true
+  reasons+=("engine is '${DOTSYNC_ENGINE:-git}', not syncthing — daemon is required for git replication")
+fi
+
+# Check ad-hoc tracked items (secrets registry).
+SECRETS_FILE="$DOTSYNC_DATA_DIR/registry/secrets.json"
+if [[ -f "$SECRETS_FILE" ]]; then
+  count=$(jq -r '.secrets | length' "$SECRETS_FILE" 2>/dev/null || echo 0)
+  if [[ "$count" -gt 0 ]]; then
+    needs_daemon=true
+    reasons+=("$count ad-hoc tracked items in secrets.json need capture/deploy")
+  fi
+fi
+
+# Check profiles for non-symlink path types.
+TOOL_DIR="$(dirname "$SCRIPT_DIR")"
+ENABLED_FILE="$DOTSYNC_DATA_DIR/registry/enabled-profiles.json"
+if [[ -f "$ENABLED_FILE" ]]; then
+  for name in $(jq -r '.profiles[]?' "$ENABLED_FILE"); do
+    pf="$TOOL_DIR/profiles/$name.json"
+    [[ -f "$pf" ]] || continue
+    non_symlink_types=$(jq -r '
+      .paths[] | .type
+      | select(. != "symlink_file" and . != "symlink_directory" and . != "shared_per_project_symlink")
+    ' "$pf" 2>/dev/null | sort -u)
+    if [[ -n "$non_symlink_types" ]]; then
+      needs_daemon=true
+      reasons+=("profile '$name' has non-symlink path types: $(echo "$non_symlink_types" | tr '\n' ' ')")
+    fi
+  done
+fi
+
+if [[ "$ACTION" == "check" ]]; then
+  if $needs_daemon; then
+    echo "⚠ daemon still required:"
+    printf '  - %s\n' "${reasons[@]}"
+    exit 1
+  else
+    echo "✓ safe to disable the daemon — all sync work is handled by Syncthing + symlinks"
+    exit 0
+  fi
+fi
+
+# ── Action: unload + remove ──────────────────────────────────────────
+if $needs_daemon && ! $FORCE; then
+  echo "✗ refusing to disable daemon:"
+  printf '  - %s\n' "${reasons[@]}"
+  echo
+  echo "Run 'dotsync no-daemon --check' for details, or pass --force to override."
+  exit 1
+fi
+
+PLIST="$HOME/Library/LaunchAgents/$DOTSYNC_KC_SERVICE.plist"
+if [[ -f "$PLIST" ]]; then
+  launchctl unload "$PLIST" 2>/dev/null && echo "✓ unloaded $PLIST" || echo "(was not loaded)"
+  rm -f "$PLIST" && echo "✓ removed $PLIST"
+else
+  echo "(no plist found at $PLIST)"
+fi
+
+cat <<EOF
+
+Daemon disabled. Sync is now driven entirely by:
+  - Syncthing's daemon (peer-to-peer replication of \$DOTSYNC_DATA_DIR)
+  - Symlinks from CC's paths into that folder
+
+To re-enable later: run 'dotsync upgrade' or restore the plist manually.
+EOF

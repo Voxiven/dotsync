@@ -1,35 +1,33 @@
 {
   "name": "claude-code",
-  "schema_version": 1,
+  "schema_version": 2,
   "description": "Claude Code: sessions, memory, settings, agents, commands",
   "homepage": "https://docs.claude.com/en/docs/claude-code",
   "iterates_per_project": true,
   "paths": [
     {
       "id": "settings",
-      "type": "file",
+      "type": "symlink_file",
       "from": "${HOME}/.claude/settings.json",
-      "to": "claude-code/dotfiles/settings.json",
-      "skip_if_empty": true
+      "to": "claude-code/dotfiles/settings.json"
     },
     {
       "id": "claude_md",
-      "type": "file",
+      "type": "symlink_file",
       "from": "${HOME}/.claude/CLAUDE.md",
-      "to": "claude-code/dotfiles/CLAUDE.md",
-      "skip_if_empty": true
+      "to": "claude-code/dotfiles/CLAUDE.md"
     },
     {
       "id": "agents",
-      "type": "directory",
-      "from": "${HOME}/.claude/agents/",
-      "to": "claude-code/agents/"
+      "type": "symlink_directory",
+      "from": "${HOME}/.claude/agents",
+      "to": "claude-code/agents"
     },
     {
       "id": "commands",
-      "type": "directory",
-      "from": "${HOME}/.claude/commands/",
-      "to": "claude-code/commands/"
+      "type": "symlink_directory",
+      "from": "${HOME}/.claude/commands",
+      "to": "claude-code/commands"
     },
     {
       "id": "sessions",
@@ -38,7 +36,8 @@
       "to": "claude-code/sessions/${PROJECT}/",
       "include_globs": ["*.jsonl"],
       "exclude_dirs": ["subagents"],
-      "max_file_mb": 50
+      "max_file_mb": 50,
+      "_note": "Sessions still go through capture/deploy in v0.4 — the project-dir symlink path requires .stignore handling for subagents/ and is deferred to a future phase. session_jsonls in syncthing mode just rsyncs jsonls into the Syncthing-replicated folder; no rebase races possible here because Syncthing has no checkout step."
     },
     {
       "id": "memory",
