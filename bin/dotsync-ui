@@ -41,14 +41,13 @@ def load_config() -> dict:
         "DOTSYNC_DATA_DIR": os.environ.get(
             "DOTSYNC_DATA_DIR", str(Path.home() / ".dotsync-data")
         ),
-        "DOTSYNC_DATA_BRANCH": os.environ.get("DOTSYNC_DATA_BRANCH", "main"),
         "DOTSYNC_KC_SERVICE": os.environ.get(
             "DOTSYNC_KC_SERVICE", "dev.dotsync.envsync"
         ),
         "DOTSYNC_PROJECT_ROOT": os.environ.get(
             "DOTSYNC_PROJECT_ROOT", str(Path.home())
         ),
-        "DOTSYNC_ENGINE": os.environ.get("DOTSYNC_ENGINE", "git"),
+        "DOTSYNC_ENGINE": os.environ.get("DOTSYNC_ENGINE", "syncthing"),
         "SYNCTHING_FOLDER_ID": os.environ.get("SYNCTHING_FOLDER_ID", "dotsync-data"),
         "SYNCTHING_API_BASE": os.environ.get(
             "SYNCTHING_API_BASE", "http://127.0.0.1:8384"
@@ -629,7 +628,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         actions = {
             "/api/sync":   ["env-sync"],
             "/api/pause":  ["env-pause"],
-            "/api/resume": ["env-resolve"],
+            "/api/resume": ["dotsync-resume"],
         }
         cmd = actions.get(path)
         if not cmd:

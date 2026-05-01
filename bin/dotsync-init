@@ -1,62 +1,7 @@
 #!/usr/bin/env bash
-# dotsync init — first-machine setup wizard. Dispatches to the engine-
-# specific implementation based on $DOTSYNC_ENGINE (default: syncthing in
-# v0.4).
-#
-# Engines:
-#   syncthing  — Syncthing peer-to-peer replication (v0.4 default)
-#   git        — legacy v0.3 path: GitHub repo + git-crypt + launchd cron
-#                (kept for users who don't want a Syncthing daemon)
+# dotsync init — first-machine setup wizard.
+# Engine: syncthing (only engine in v0.4+).
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-ENGINE="${DOTSYNC_ENGINE:-}"
-ARGS=()
-HELP_REQUESTED=false
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --engine) ENGINE="$2"; shift 2 ;;
-    --engine=*) ENGINE="${1#*=}"; shift ;;
-    -h|--help) HELP_REQUESTED=true; shift ;;
-    *) ARGS+=("$1"); shift ;;
-  esac
-done
-
-# When --engine is explicit, defer help to the engine implementation so
-# users see per-engine flags. With no --engine and --help, print the
-# dispatcher overview.
-if $HELP_REQUESTED && [[ -z "$ENGINE" ]]; then
-  cat <<EOF
-dotsync init — set up dotsync on the first machine.
-
-Usage: dotsync init [--engine <git|syncthing>] [other-engine-options]
-
-Options:
-  --engine syncthing   Use Syncthing for replication (v0.4 default).
-                       No GitHub repo needed; peer-to-peer.
-  --engine git         Use the v0.3 git+git-crypt+GitHub flow.
-                       Requires a GitHub data repo.
-
-Per-engine help:
-  dotsync init --engine syncthing --help
-  dotsync init --engine git --help
-EOF
-  exit 0
-fi
-
-ENGINE="${ENGINE:-syncthing}"
-$HELP_REQUESTED && ARGS+=("--help")
-
-case "$ENGINE" in
-  syncthing)
-    exec "$SCRIPT_DIR/dotsync-init-syncthing" ${ARGS[@]+"${ARGS[@]}"}
-    ;;
-  git)
-    exec "$SCRIPT_DIR/dotsync-init-git" ${ARGS[@]+"${ARGS[@]}"}
-    ;;
-  *)
-    echo "✗ unknown engine: $ENGINE (must be 'git' or 'syncthing')" >&2
-    exit 1
-    ;;
-esac
+exec "$SCRIPT_DIR/dotsync-init-syncthing" "$@"

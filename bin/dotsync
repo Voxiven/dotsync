@@ -5,7 +5,7 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-VERSION="0.3.0-dev"
+VERSION="0.4.0-dev"
 
 usage() {
   cat <<EOF
@@ -15,20 +15,18 @@ Usage: dotsync <command> [args...]
 
 Setup (run once per machine):
   init                Set up dotsync on the first machine
-  join                Set up dotsync on a second machine (pair w/ first)
-  pair                Generate a one-time pairing code (called from join)
-  add-peer            Finish syncthing pairing — add a peer's device ID
-  restore             Re-attach using an existing Keychain identity
-  upgrade             Migrate this machine from git engine → syncthing
-  uninstall           Tear down a dotsync setup on this machine
+  pair                Generate a one-time pairing code on this machine
+  join                Set up another machine using a code from 'pair'
+  add-peer            Finish bidirectional pairing — add a peer's device ID
+  uninstall           Tear down dotsync on this machine
 
 Daily use:
   status              One-line summary of sync state
-  sync                Force a sync now (daemon usually does this every 60s)
+  sync                Force a sync now (daemon does this every 60s)
   ui                  Open status dashboard at http://127.0.0.1:7878
   pause / resume      Halt or restart the sync daemon
   setup-symlinks      Wire symlink-typed profile paths into the Syncthing folder
-  no-daemon           Unload our polling daemon (Syncthing handles sync directly)
+  no-daemon           Unload our polling daemon (let Syncthing handle sync alone)
 
 Profiles (per-tool sync configurations):
   profiles            List available + enabled profiles
@@ -41,8 +39,7 @@ Tracked items:
   list                Show everything tracked, by profile
 
 Conflicts & logs:
-  resolve             Interactive conflict resolution (git engine)
-  clean-conflicts     Remove Syncthing .sync-conflict-* files (syncthing engine)
+  clean-conflicts     Remove Syncthing .sync-conflict-* files
   logs [--tail]       Show sync log
 
 Help:

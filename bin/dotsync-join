@@ -1,42 +1,7 @@
 #!/usr/bin/env bash
-# dotsync join — dispatcher. Default engine: syncthing (v0.4).
+# dotsync join — set up a second machine using a pairing code from the first.
+# Engine: syncthing.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-ENGINE="${DOTSYNC_ENGINE:-}"
-ARGS=()
-HELP_REQUESTED=false
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --engine) ENGINE="$2"; shift 2 ;;
-    --engine=*) ENGINE="${1#*=}"; shift ;;
-    -h|--help) HELP_REQUESTED=true; shift ;;
-    *) ARGS+=("$1"); shift ;;
-  esac
-done
-
-if $HELP_REQUESTED && [[ -z "$ENGINE" ]]; then
-  cat <<EOF
-dotsync join — set up dotsync on a second machine using a pairing code.
-
-Usage: dotsync join [--engine <git|syncthing>] [other-engine-options]
-
-Engine defaults to syncthing in v0.4. Use --engine git to join a v0.3
-git-based setup.
-
-Per-engine help:
-  dotsync join --engine syncthing --help
-  dotsync join --engine git --help
-EOF
-  exit 0
-fi
-
-ENGINE="${ENGINE:-syncthing}"
-$HELP_REQUESTED && ARGS+=("--help")
-
-case "$ENGINE" in
-  syncthing) exec "$SCRIPT_DIR/dotsync-join-syncthing" ${ARGS[@]+"${ARGS[@]}"} ;;
-  git)       exec "$SCRIPT_DIR/dotsync-join-git" ${ARGS[@]+"${ARGS[@]}"} ;;
-  *) echo "✗ unknown engine: $ENGINE" >&2; exit 1 ;;
-esac
+exec "$SCRIPT_DIR/dotsync-join-syncthing" "$@"

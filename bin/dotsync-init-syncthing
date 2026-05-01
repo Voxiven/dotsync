@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# dotsync-init-syncthing — first-machine wizard for the Syncthing engine.
+# dotsync-init-syncthing — first-machine wizard.
 #
 # Steps:
-#   1. Preflight (macOS, brew, install missing deps incl. syncthing)
+#   1. Preflight (macOS, brew, install deps including syncthing)
 #   2. Start Syncthing daemon (auto-generates config + API key)
 #   3. Wait for daemon ready, cache the API key
-#   4. Create the data dir + add it as a Syncthing folder
+#   4. Create the data dir + register it as a Syncthing folder
 #   5. Profile selection + projects.json
-#   6. Write $DOTSYNC_CONFIG with DOTSYNC_ENGINE=syncthing
-#   7. Install our launchd agent (still useful: periodic capture/deploy)
+#   6. Write $DOTSYNC_CONFIG
+#   7. Install our launchd agent for periodic capture/deploy
 #   8. Print device ID for pairing
 #
-# No GitHub repo. No age key. No git-crypt. The age identity / git-crypt
-# stuff that v0.3 had is gone — Syncthing's TLS-in-transit + peer device
-# trust is the security model. (See docs/phase-4-syncthing.md, decision D1.)
+# Security model: TLS-in-transit between paired Syncthing peers. No
+# remote storage; data only exists on each peer's disk in plaintext
+# (same as ~/.claude/* already is locally).
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

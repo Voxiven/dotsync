@@ -1,11 +1,34 @@
 #!/usr/bin/env bash
+# env-sync — periodic capture/deploy cycle. Driven by the launchd agent
+# every 60s by default. Idempotent: most paths are symlinked into the
+# Syncthing folder and do nothing here; non-symlink paths (sessions,
+# ad-hoc tracked secrets) get rsync'd in/out via the profile engine.
+#
+# Sync engine: Syncthing (the only engine in v0.4+). The Syncthing daemon
+# replicates the data dir to peers; this script bridges between CC's
+# canonical paths and that folder for paths that aren't symlink-able.
 set -uo pipefail
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
 source "$SCRIPT_DIR/_common.sh"
-source "$SCRIPT_DIR/_crypt.sh"
+# shellcheck source=/dev/null
 source "$SCRIPT_DIR/_registry.sh"
+# shellcheck source=/dev/null
 source "$SCRIPT_DIR/_profile.sh"
+# shellcheck source=/dev/null
 source "$SCRIPT_DIR/_syncthing.sh"
+
+# Capture/deploy ad-hoc tracked items (the secrets registry — used by
+# 'dotsync track' and the project-secrets profile's user additions).
+capture_secrets() {
+  local repo_p real_p
+  while IFS=$'\t' read -r repo_p real_p; do
+    [[ -f "$real_p" ]] || continue
+    mkdir -p "$(dirname "$ENV_REPO_ROOT/$repo_p")"
+    rsync -a --checksum "$real_p" "$ENV_REPO_ROOT/$repo_p"
+  done < <(secrets_pairs)
+}
 
 deploy_secrets() {
   local repo_p real_p
@@ -16,153 +39,29 @@ deploy_secrets() {
   done < <(secrets_pairs)
 }
 
-capture_secrets() {
-  local repo_p real_p
-  while IFS=$'\t' read -r repo_p real_p; do
-    [[ -f "$real_p" ]] || continue
-    mkdir -p "$(dirname "$ENV_REPO_ROOT/$repo_p")"
-    rsync -a --checksum "$real_p" "$ENV_REPO_ROOT/$repo_p"
-  done < <(secrets_pairs)
-}
-
-# Capture dotfiles from $HOME into the repo. Skip:
-#   - symlinks (legacy install; env-bootstrap converts these to copies)
-#   - empty files (creates noise commits that diverge from peers and trip
-#     git-crypt's clean-filter roundtrip on rebase checkouts)
-capture_dotfiles() {
-  local repo_p real_p
-  while IFS=$'\t' read -r repo_p real_p; do
-    [[ -s "$real_p" && ! -L "$real_p" ]] || continue
-    mkdir -p "$(dirname "$ENV_REPO_ROOT/$repo_p")"
-    rsync -a --checksum "$real_p" "$ENV_REPO_ROOT/$repo_p"
-  done < <(dotfile_pairs)
-}
-
-deploy_dotfiles() {
-  local repo_p real_p
-  while IFS=$'\t' read -r repo_p real_p; do
-    [[ -s "$ENV_REPO_ROOT/$repo_p" ]] || continue
-    # Don't clobber a legacy symlink — env-bootstrap migrates those.
-    [[ -L "$real_p" ]] && continue
-    mkdir -p "$(dirname "$real_p")"
-    rsync -a --checksum "$ENV_REPO_ROOT/$repo_p" "$real_p"
-  done < <(dotfile_pairs)
-}
-
-deploy_sessions() {
-  local name encoded
-  while IFS=$'\t' read -r name encoded; do
-    local src="$ENV_REPO_ROOT/sessions/$name"
-    local dst="$HOME/.claude/projects/$encoded"
-    [[ -d "$src" ]] || continue
-    mkdir -p "$dst"
-    rsync -a --checksum --include='*.jsonl' --exclude='*' "$src/" "$dst/"
-  done < <(project_pairs)
-}
-
-capture_sessions() {
-  # Honor DOTSYNC_SESSION_MAX_MB (default 50) — skip files above this size to
-  # avoid GitHub's 100MB hard limit and the slowness of pushing huge encrypted
-  # blobs that don't pack-delta. Honor DOTSYNC_SKIP_PROJECTS (space-separated;
-  # accepts portable names "Echolive" or per-machine encoded names like
-  # "-Users-foo-Workspace-Echolive" for backward compatibility).
-  local max_mb="${DOTSYNC_SESSION_MAX_MB:-50}"
-  local skip="${DOTSYNC_SKIP_PROJECTS:-}"
-  local name encoded
-  while IFS=$'\t' read -r name encoded; do
-    [[ " $skip " == *" $name "* || " $skip " == *" $encoded "* ]] && continue
-    local src="$HOME/.claude/projects/$encoded"
-    local dst="$ENV_REPO_ROOT/sessions/$name"
-    [[ -d "$src" ]] || continue
-    mkdir -p "$dst"
-    # Only top-level *.jsonl, not nested subagents/. Filter by size.
-    find "$src" -maxdepth 1 -name '*.jsonl' -size "-${max_mb}M" 2>/dev/null \
-      | while read -r jf; do
-          rsync -a --checksum "$jf" "$dst/$(basename "$jf")"
-        done
-  done < <(project_pairs)
-}
-
-# One-time migration: rename per-machine encoded session dirs in the repo
-# to portable names. Pre-portability the storage layout was
-# sessions/-Users-foo-Workspace-Omphalis/ — keyed by Claude Code's
-# per-machine path. That meant Mac A and Mac B's sessions for the same
-# project lived in different repo dirs and never cross-synced. After
-# migration: sessions/Omphalis/, same on every machine. Merges if the
-# portable dir already exists (another machine migrated first).
-migrate_session_layout() {
-  [[ -d "$ENV_REPO_ROOT/sessions" ]] || return 0
-  local name encoded
-  while IFS=$'\t' read -r name encoded; do
-    [[ "$name" == "$encoded" ]] && continue   # v1 schema, no migration needed
-    local old="$ENV_REPO_ROOT/sessions/$encoded"
-    local new="$ENV_REPO_ROOT/sessions/$name"
-    [[ -d "$old" ]] || continue
-    log_info "migrating sessions: $encoded → $name"
-    mkdir -p "$new"
-    rsync -a "$old/" "$new/"
-    rm -rf "$old"
-  done < <(project_pairs)
-}
-
-# Remove any session files in the repo that exceed the size limit OR belong to
-# skipped projects. Idempotent.
+# Prune session storage in the repo: drop oversize files, drop subagents/
+# subtrees (per-machine state we don't sync), drop skipped projects.
+# Idempotent.
 prune_sessions() {
   local max_mb="${DOTSYNC_SESSION_MAX_MB:-50}"
   local skip="${DOTSYNC_SKIP_PROJECTS:-}"
   if [[ -d "$ENV_REPO_ROOT/sessions" ]]; then
     find "$ENV_REPO_ROOT/sessions" -name '*.jsonl' -size "+${max_mb}M" -delete 2>/dev/null || true
     find "$ENV_REPO_ROOT/sessions" -type d -name 'subagents' -exec rm -rf {} + 2>/dev/null || true
-    # Skip-list entries can be portable names or legacy encoded names.
-    # Resolve to portable names via project_pairs and remove from the repo.
     local name encoded
     while IFS=$'\t' read -r name encoded; do
       if [[ " $skip " == *" $name "* || " $skip " == *" $encoded "* ]]; then
         rm -rf "$ENV_REPO_ROOT/sessions/$name" 2>/dev/null || true
-        # Also remove the legacy encoded dir if it survived migration.
         [[ "$name" != "$encoded" ]] && rm -rf "$ENV_REPO_ROOT/sessions/$encoded" 2>/dev/null || true
       fi
     done < <(project_pairs)
   fi
 }
 
-handle_conflict() {
-  local ts; ts="$(date -u +%Y%m%dT%H%M%SZ)"
-  local conflict_dir="$ENV_CONFLICTS_DIR/$ts"
-  mkdir -p "$conflict_dir"
-  local conflicted_files
-  conflicted_files="$(git diff --name-only --diff-filter=U)"
-  # Smudge through git-crypt to produce plaintext conflict files.
-  # git show extracts the encrypted blob; piping to `git-crypt smudge` decrypts
-  # it when the repo is unlocked. Falls back to the raw blob if smudge fails.
-  _smudge_blob() {
-    local stage="$1" path="$2" out="$3"
-    git show ":${stage}:${path}" 2>/dev/null \
-      | git-crypt smudge 2>/dev/null \
-      > "$out" || git show ":${stage}:${path}" > "$out" 2>/dev/null || true
-  }
-  # During `git rebase origin/"$DOTSYNC_DATA_BRANCH"`:
-  #   stage 1 = common ancestor (base)
-  #   stage 2 = ours = origin/"$DOTSYNC_DATA_BRANCH" = the REMOTE version
-  #   stage 3 = theirs = local commit being replayed = the LOCAL version
-  while IFS= read -r f; do
-    [[ -z "$f" ]] && continue
-    _smudge_blob 1 "$f" "$conflict_dir/$(basename "$f").base"
-    _smudge_blob 3 "$f" "$conflict_dir/$(basename "$f").local"
-    _smudge_blob 2 "$f" "$conflict_dir/$(basename "$f").remote"
-  done <<< "$conflicted_files"
-  git rebase --abort 2>/dev/null || true
-  set_paused
-  notify_user "Dev-env sync paused" "Conflict in: $(echo "$conflicted_files" | tr '\n' ' '). Run env-resolve."
-  log_error "conflict in: $conflicted_files (saved to $conflict_dir)"
-}
+# ── main ─────────────────────────────────────────────────────────────
 
-# --- main ---
-# Prevent concurrent runs (daemon vs manual). flock isn't on macOS by default,
-# so we use a mkdir-based lock that works everywhere.
-# Lock dir lives in $DOTSYNC_STATE_DIR (per-machine) — NOT in
-# $DOTSYNC_DATA_DIR, which would replicate the lock and cause peer
-# conflicts. ENV_LOCK_DIR is set in _common.sh.
+# Per-machine mutex (mkdir lock; flock isn't on default macOS).
+# $ENV_LOCK_DIR is in $DOTSYNC_STATE_DIR (per-machine), set in _common.sh.
 if ! mkdir "$ENV_LOCK_DIR" 2>/dev/null; then
   log_info "another env-sync is running; exiting cleanly"
   exit 0
@@ -170,127 +69,40 @@ fi
 trap 'rmdir "$ENV_LOCK_DIR" 2>/dev/null' EXIT
 
 if is_paused; then
-  log_warn "sync paused (.sync-paused exists); run env-resolve"
+  log_warn "sync paused; run 'dotsync resume' to re-enable"
   exit 0
 fi
 
-cd "$ENV_REPO_ROOT" || die "cannot cd to $ENV_REPO_ROOT"
+cd "$ENV_REPO_ROOT" || die "cannot cd to $ENV_REPO_ROOT (run 'dotsync init' first?)"
 
-# ──────────────────────────────────────────────────────────────────────
-# Engine: syncthing | git
-#   syncthing — Syncthing daemon replicates the data dir; we just capture
-#               and deploy. No git ops, no rebase, no smudge filters.
-#   git       — legacy v0.3 path: capture → commit → fetch → rebase →
-#               deploy → push.
-# ──────────────────────────────────────────────────────────────────────
+if ! st_running; then
+  log_warn "Syncthing daemon not reachable at $SYNCTHING_API_BASE; skipping cycle"
+  exit 0
+fi
 
-if syncthing_mode; then
-  # ── Syncthing engine ────────────────────────────────────────────────
-  if ! st_running; then
-    log_warn "Syncthing daemon not reachable at $SYNCTHING_API_BASE; skipping sync"
-    exit 0
-  fi
+# 1. Capture local-machine state into the data dir. Syncthing replicates
+#    async. Symlinked profile paths are no-ops here (already in-place);
+#    only non-symlink paths (sessions, project-secrets) do real work.
+capture_secrets
+if profile_mode_active; then
+  log_info "profile mode: $(enabled_profiles | tr '\n' ' ')"
+  profile_run_all capture
+fi
+prune_sessions
 
-  # 1. Capture local state into the data dir. Syncthing replicates async.
-  capture_secrets
-  if profile_mode_active; then
-    log_info "syncthing engine, profile mode: $(enabled_profiles | tr '\n' ' ')"
-    profile_run_all capture
-  else
-    capture_sessions
-    capture_dotfiles
-  fi
-  prune_sessions
+# 2. Nudge Syncthing to scan now (skip the next watch interval).
+st_rescan >/dev/null 2>&1 || true
 
-  # 2. Nudge Syncthing — without this, replication waits for the next
-  #    filesystem-watch event (which fswatch covers, but rescan is cheap
-  #    and makes 'dotsync sync' synchronous-feeling).
-  st_rescan >/dev/null 2>&1 || true
+# 3. Wait briefly for inbound replication to settle so deploy reads the
+#    post-replication state. Best-effort; deploy works on whatever's
+#    there if the wait times out.
+st_wait_idle "$SYNCTHING_FOLDER_ID" 10 >/dev/null 2>&1 || true
 
-  # 3. Wait briefly for inbound changes to settle so deploy reads the
-  #    post-replication state. Best-effort; deploy works on whatever's
-  #    there if the wait times out.
-  st_wait_idle "$SYNCTHING_FOLDER_ID" 10 >/dev/null 2>&1 || true
-
-  # 4. Deploy.
-  deploy_secrets
-  if profile_mode_active; then
-    profile_run_all deploy
-  else
-    deploy_sessions
-    deploy_dotfiles
-  fi
-else
-  # ── Legacy git engine (v0.3) ────────────────────────────────────────
-  unlock_repo
-
-  # 1. Capture local-machine state FIRST so any pending edits land in a
-  #    commit before we fetch/rebase. Avoids "unstaged changes" rebase
-  #    aborts when the working tree is dirty from a prior run.
-  capture_secrets
-  if profile_mode_active; then
-    log_info "git engine, profile mode: $(enabled_profiles | tr '\n' ' ')"
-    profile_run_all capture
-  else
-    migrate_session_layout
-    capture_sessions
-    capture_dotfiles
-  fi
-  prune_sessions
-
-  if [[ -n "$(git status --porcelain)" ]]; then
-    git add -A
-    git commit -m "auto-sync $(hostname -s) $(date -u +%Y-%m-%dT%H:%M:%SZ)" --quiet \
-      || die "commit failed"
-  fi
-
-  # 2. Pull remote changes.
-  git fetch origin "$DOTSYNC_DATA_BRANCH" --quiet || die "git fetch failed"
-
-  local_sha="$(git rev-parse HEAD)"
-  remote_sha="$(git rev-parse origin/"$DOTSYNC_DATA_BRANCH")"
-
-  if [[ "$local_sha" != "$remote_sha" ]]; then
-    # Both branches handle a real race: a long-lived process (Claude
-    # Code, an editor) writes through a symlink into the working tree
-    # between step 1's commit and the merge/rebase's internal checkout.
-    # Without autostash, the operation aborts with "Your local changes
-    # to ... would be overwritten by checkout".
-    if git merge-base --is-ancestor "$local_sha" "$remote_sha"; then
-      log_info "fast-forward to $remote_sha"
-      git -c merge.autoStash=true merge --ff-only "$remote_sha" --quiet \
-        || die "ff merge failed"
-    else
-      log_info "diverged; rebasing"
-      if ! git rebase --autostash origin/"$DOTSYNC_DATA_BRANCH" --quiet; then
-        handle_conflict
-        exit 2
-      fi
-    fi
-  fi
-
-  # 3. Deploy the merged state to canonical paths.
-  deploy_secrets
-  if profile_mode_active; then
-    profile_run_all deploy
-  else
-    deploy_sessions
-    deploy_dotfiles
-  fi
-
-  # 4. Push any local commits we made in step 1.
-  if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/"$DOTSYNC_DATA_BRANCH")" ]]; then
-    if ! git push origin "$DOTSYNC_DATA_BRANCH" --quiet 2>/dev/null; then
-      log_warn "push rejected; fetching + rebasing"
-      git fetch origin "$DOTSYNC_DATA_BRANCH" --quiet
-      if ! git rebase --autostash origin/"$DOTSYNC_DATA_BRANCH" --quiet; then
-        handle_conflict
-        exit 2
-      fi
-      git push origin "$DOTSYNC_DATA_BRANCH" --quiet || die "push failed after rebase"
-    fi
-    log_info "pushed local changes"
-  fi
+# 4. Deploy peer state to canonical paths. Same caveat as capture:
+#    symlinked paths are no-ops; only non-symlink paths do real work.
+deploy_secrets
+if profile_mode_active; then
+  profile_run_all deploy
 fi
 
 date -u +%Y-%m-%dT%H:%M:%SZ > "$ENV_LASTSYNC_FILE"

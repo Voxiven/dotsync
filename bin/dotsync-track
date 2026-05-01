@@ -12,26 +12,26 @@ source "$SCRIPT_DIR/_common.sh"
 source "$SCRIPT_DIR/_registry.sh"
 
 REPO_PATH=""
-ENCRYPT=true
 
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   cat <<EOF
 dotsync track — register a file or directory for syncing.
 
-Usage: dotsync track <path> [--to <repo-subpath>] [--no-encrypt]
+Usage: dotsync track <path> [--to <repo-subpath>]
 
 Examples:
   dotsync track ~/.config/nvim/init.lua
-    → captured to: tracked/.config/nvim/init.lua
+    → captured to: tracked/init.lua
 
   dotsync track ~/.zshrc --to shell/zshrc
     → captured to: tracked/shell/zshrc
 
-  dotsync track ~/some/.env --no-encrypt
-    → committed in plaintext (NOT recommended for secrets)
+The path is captured into the data dir on every sync cycle and deployed
+back to peers via Syncthing replication.
 
-The path is captured into the data repo on every sync and deployed back
-out on every sync (so changes from any machine reach all peers).
+Privacy: all replication is TLS-in-transit between paired peers. No
+remote storage. Files on disk are plaintext on each peer (same as
+~/.claude/* already is locally).
 EOF
   exit 0
 fi
@@ -41,9 +41,8 @@ real_path_in="$1"; shift
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --to)         REPO_PATH="$2"; shift 2 ;;
-    --no-encrypt) ENCRYPT=false; shift ;;
-    *)            die "unknown flag: $1" ;;
+    --to) REPO_PATH="$2"; shift 2 ;;
+    *)    die "unknown flag: $1" ;;
   esac
 done
 
@@ -75,18 +74,6 @@ fi
 # with "tracked/" — this is a single registry by design (one source of truth).
 $ENCRYPT && registry_add_secret "$REPO_PATH" "$templated" \
   || registry_add_secret "$REPO_PATH" "$templated"
-
-# Update .gitattributes if encrypted and pattern not already covered.
-if $ENCRYPT; then
-  ga="$DOTSYNC_DATA_DIR/.gitattributes"
-  if ! grep -q '^tracked/\*\*' "$ga" 2>/dev/null; then
-    {
-      echo ""
-      echo "# Ad-hoc tracked items (added via 'dotsync track')"
-      echo "tracked/**           filter=git-crypt diff=git-crypt"
-    } >> "$ga"
-  fi
-fi
 
 echo "tracked: $real_path"
 echo "  repo:    $REPO_PATH"
