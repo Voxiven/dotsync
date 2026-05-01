@@ -23,13 +23,14 @@ capture_secrets() {
   done < <(secrets_pairs)
 }
 
-# Capture dotfiles from $HOME into the repo. Skip symlinks — those are a
-# legacy install pattern that gets converted to copies on the next
-# env-bootstrap run.
+# Capture dotfiles from $HOME into the repo. Skip:
+#   - symlinks (legacy install; env-bootstrap converts these to copies)
+#   - empty files (creates noise commits that diverge from peers and trip
+#     git-crypt's clean-filter roundtrip on rebase checkouts)
 capture_dotfiles() {
   local repo_p real_p
   while IFS=$'\t' read -r repo_p real_p; do
-    [[ -f "$real_p" && ! -L "$real_p" ]] || continue
+    [[ -s "$real_p" && ! -L "$real_p" ]] || continue
     mkdir -p "$(dirname "$ENV_REPO_ROOT/$repo_p")"
     rsync -a --checksum "$real_p" "$ENV_REPO_ROOT/$repo_p"
   done < <(dotfile_pairs)
@@ -38,7 +39,7 @@ capture_dotfiles() {
 deploy_dotfiles() {
   local repo_p real_p
   while IFS=$'\t' read -r repo_p real_p; do
-    [[ -f "$ENV_REPO_ROOT/$repo_p" ]] || continue
+    [[ -s "$ENV_REPO_ROOT/$repo_p" ]] || continue
     # Don't clobber a legacy symlink — env-bootstrap migrates those.
     [[ -L "$real_p" ]] && continue
     mkdir -p "$(dirname "$real_p")"

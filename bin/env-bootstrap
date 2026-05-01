@@ -147,13 +147,21 @@ mkdir -p "$DOTSYNC_DATA_DIR/dotfiles"
 # to (e.g. ~/.claude/settings.json), which races env-sync's rebase: a write
 # between the autostash and the internal checkout makes rebase abort with
 # "Your local changes to ... would be overwritten by checkout."
+#
+# Critically, NEVER create empty placeholders. An empty file committed on
+# one machine but not another leaves the diverging machine unable to
+# rebase: git-crypt's clean filter doesn't roundtrip empty plaintext to
+# the same blob HEAD stores, so checkout's safety check sees a phantom
+# uncommitted change. capture/deploy pick up content naturally once it
+# exists; until then, do nothing.
 while IFS=$'\t' read -r repo_p real_p; do
   repo_full="$DOTSYNC_DATA_DIR/$repo_p"
-  mkdir -p "$(dirname "$repo_full")"
 
   # Migrate legacy symlink → real file. Snapshot the symlink target's
   # current content (live process may have written to it), drop the link,
-  # restore as a regular file.
+  # restore as a regular file. If the symlink was dangling, leave real_p
+  # nonexistent — it'll be filled in by deploy below if the repo has
+  # content, or stay absent until the user populates it.
   if [[ -L "$real_p" ]]; then
     target="$(readlink "$real_p")"
     if [[ "$target" == "$repo_full" ]]; then
@@ -165,23 +173,21 @@ while IFS=$'\t' read -r repo_p real_p; do
     fi
   fi
 
-  # Seed direction:
-  #   - real exists, repo missing/empty → seed repo from real (first machine)
-  #   - repo exists, real missing       → deploy repo to real (joining machine)
-  #   - both exist                       → leave alone; sync will reconcile
-  if [[ -f "$real_p" && ! -L "$real_p" ]]; then
+  # Seed direction (note: -s, not -f — empty files are treated as absent):
+  #   - real has content, repo doesn't → seed repo from real
+  #   - repo has content, real doesn't → deploy repo to real
+  #   - both have content              → sync reconciles on next run
+  #   - neither has content            → do nothing
+  if [[ -s "$real_p" && ! -L "$real_p" ]]; then
     if [[ ! -s "$repo_full" ]]; then
+      mkdir -p "$(dirname "$repo_full")"
       cp "$real_p" "$repo_full"
       log_info "seeded $repo_p from $real_p"
     fi
-  elif [[ -f "$repo_full" ]]; then
+  elif [[ -s "$repo_full" ]]; then
     mkdir -p "$(dirname "$real_p")"
     cp "$repo_full" "$real_p"
     log_info "deployed $repo_p → $real_p"
-  else
-    # Neither side has content; create empty placeholders so capture/deploy
-    # don't skip on subsequent runs.
-    touch "$repo_full"
   fi
 done < <(dotfile_pairs)
 
