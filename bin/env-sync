@@ -35,14 +35,39 @@ deploy_sessions() {
 }
 
 capture_sessions() {
+  # Honor DOTSYNC_SESSION_MAX_MB (default 50) — skip files above this size to
+  # avoid GitHub's 100MB hard limit and the slowness of pushing huge encrypted
+  # blobs that don't pack-delta. Honor DOTSYNC_SKIP_PROJECTS (space-separated
+  # encoded names) to skip whole projects (e.g. zombie projects).
+  local max_mb="${DOTSYNC_SESSION_MAX_MB:-50}"
+  local skip="${DOTSYNC_SKIP_PROJECTS:-}"
   local proj
   while read -r proj; do
+    [[ " $skip " == *" $proj "* ]] && continue
     local src="$HOME/.claude/projects/$proj"
     local dst="$ENV_REPO_ROOT/sessions/$proj"
     [[ -d "$src" ]] || continue
     mkdir -p "$dst"
-    rsync -a --checksum --include='*.jsonl' --exclude='*' "$src/" "$dst/"
+    # Only top-level *.jsonl, not nested subagents/. Filter by size.
+    find "$src" -maxdepth 1 -name '*.jsonl' -size "-${max_mb}M" 2>/dev/null \
+      | while read -r jf; do
+          rsync -a --checksum "$jf" "$dst/$(basename "$jf")"
+        done
   done < <(project_names)
+}
+
+# Remove any session files in the repo that exceed the size limit OR belong to
+# skipped projects. Idempotent.
+prune_sessions() {
+  local max_mb="${DOTSYNC_SESSION_MAX_MB:-50}"
+  local skip="${DOTSYNC_SKIP_PROJECTS:-}"
+  if [[ -d "$ENV_REPO_ROOT/sessions" ]]; then
+    find "$ENV_REPO_ROOT/sessions" -name '*.jsonl' -size "+${max_mb}M" -delete 2>/dev/null || true
+    find "$ENV_REPO_ROOT/sessions" -type d -name 'subagents' -exec rm -rf {} + 2>/dev/null || true
+    for s in $skip; do
+      rm -rf "$ENV_REPO_ROOT/sessions/$s" 2>/dev/null || true
+    done
+  fi
 }
 
 handle_conflict() {
@@ -77,6 +102,15 @@ handle_conflict() {
 }
 
 # --- main ---
+# Prevent concurrent runs (daemon vs manual). flock isn't on macOS by default,
+# so we use a mkdir-based lock that works everywhere.
+LOCK_DIR="${ENV_REPO_ROOT}/.sync.lock"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  log_info "another env-sync is running; exiting cleanly"
+  exit 0
+fi
+trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+
 if is_paused; then
   log_warn "sync paused (.sync-paused exists); run env-resolve"
   exit 0
@@ -85,6 +119,20 @@ fi
 unlock_repo
 cd "$ENV_REPO_ROOT" || die "cannot cd to $ENV_REPO_ROOT"
 
+# 1. Capture local-machine state FIRST so any pending edits land in a commit
+#    before we fetch/rebase. Avoids "unstaged changes" rebase aborts when the
+#    working tree is dirty from a prior run or external edit.
+capture_secrets
+capture_sessions
+prune_sessions
+
+if [[ -n "$(git status --porcelain)" ]]; then
+  git add -A
+  git commit -m "auto-sync $(hostname -s) $(date -u +%Y-%m-%dT%H:%M:%SZ)" --quiet \
+    || die "commit failed"
+fi
+
+# 2. Pull remote changes.
 git fetch origin "$DOTSYNC_DATA_BRANCH" --quiet || die "git fetch failed"
 
 local_sha="$(git rev-parse HEAD)"
@@ -103,15 +151,12 @@ if [[ "$local_sha" != "$remote_sha" ]]; then
   fi
 fi
 
+# 3. Deploy the merged state to canonical paths.
 deploy_secrets
 deploy_sessions
-capture_secrets
-capture_sessions
 
-if [[ -n "$(git status --porcelain)" ]]; then
-  git add -A
-  git commit -m "auto-sync $(hostname -s) $(date -u +%Y-%m-%dT%H:%M:%SZ)" --quiet \
-    || die "commit failed"
+# 4. Push any local commits we made in step 1.
+if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/"$DOTSYNC_DATA_BRANCH")" ]]; then
   if ! git push origin "$DOTSYNC_DATA_BRANCH" --quiet 2>/dev/null; then
     log_warn "push rejected; fetching + rebasing"
     git fetch origin "$DOTSYNC_DATA_BRANCH" --quiet

@@ -14,3 +14,14 @@ DOTSYNC_DATA_BRANCH="main"
 # macOS Keychain entry that holds your age identity (private key).
 DOTSYNC_KC_SERVICE="dev.dotsync.envsync"
 DOTSYNC_KC_ACCOUNT="default"
+
+# Skip session JSONLs above this size (MB). GitHub rejects files >100MB.
+# 50 is a safe default — files this big are usually degenerate sessions
+# (large file reads, image captures) where cross-machine resume is rare.
+DOTSYNC_SESSION_MAX_MB=50
+
+# Space-separated encoded project names whose sessions should NOT sync.
+# Use for archived/zombie projects whose sessions grow huge but you don't
+# need cross-machine continuity for.
+# Example: DOTSYNC_SKIP_PROJECTS="-Users-you-old-project -Users-you-archive"
+DOTSYNC_SKIP_PROJECTS=""

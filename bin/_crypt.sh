@@ -34,16 +34,17 @@ fi
 # Returns 0 if the working tree is currently unlocked (plaintext visible).
 is_repo_unlocked() {
   cd "$ENV_REPO_ROOT" || return 1
-  # Locked encrypted blobs start with the magic "\0GITCRYPT\0" header.
-  local sample
-  sample="$(git-crypt status -e 2>/dev/null | awk '$1 == "encrypted:" {print $2; exit}')"
-  if [[ -z "$sample" ]]; then
-    return 0   # no encrypted files yet → considered unlocked
-  fi
-  if head -c 10 "$sample" 2>/dev/null | LC_ALL=C grep -q $'\0GITCRYPT\0'; then
-    return 1   # locked
-  fi
-  return 0     # unlocked
+  # Find the first NON-EMPTY encrypted file and check for git-crypt's magic
+  # header (10 bytes: "\0GITCRYPT\0"). NUL bytes can't pass through bash
+  # strings or argv, so we hex-encode the first 10 bytes and string-compare.
+  local sample magic
+  while IFS= read -r sample; do
+    [[ -n "$sample" && -s "$sample" ]] || continue
+    magic="$(head -c 10 "$sample" 2>/dev/null | xxd -p | tr -d '\n')"
+    [[ "$magic" == "00474954435259505400" ]] && return 1   # \0GITCRYPT\0 → locked
+    return 0
+  done < <(git-crypt status -e 2>/dev/null | awk '$1 == "encrypted:" {print $2}')
+  return 0   # no non-empty encrypted files seen → considered unlocked
 }
 
 # Decrypts the age-encrypted git-crypt key with the identity from Keychain
