@@ -1,0 +1,393 @@
+#!/usr/bin/env bash
+# dotsync-init — first-machine wizard.
+#
+# Steps:
+#   1. Preflight (macOS, brew, install missing CLI deps)
+#   2. Repo: create via gh, or use --repo <url>; clone locally
+#   3. Encryption: generate age identity → Keychain; git-crypt init;
+#      encrypt git-crypt key with age, commit
+#   4. Recovery: write ~/Documents/dotsync-recovery-<date>.txt
+#   5. Profiles: prompt user to choose which to enable
+#   6. Config: write ~/.config/dotsync/config.sh; detect project root
+#   7. Daemon: install launchd agent
+#   8. First sync: push initial commit
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOL_DIR="$(dirname "$SCRIPT_DIR")"
+
+REPO_URL=""
+BRANCH="main"
+NON_INTERACTIVE=false
+FORCE=false
+
+usage() {
+  cat <<EOF
+dotsync init — set up dotsync on the first machine.
+
+Usage: dotsync init [options]
+
+Options:
+  --repo <url>          Use an existing private git repo instead of creating one via gh.
+                        Example: --repo git@github.com:you/dotsync-data.git
+  --branch <name>       Branch to track in the data repo (default: main).
+  --non-interactive     Accept all defaults without prompting.
+  --force               Overwrite existing config (use with care).
+  -h, --help            Show this help.
+
+What it does:
+  1. Installs missing dependencies via Homebrew (gh, age, git-crypt, jq, fswatch, magic-wormhole).
+  2. Creates a private GitHub repo (or uses --repo).
+  3. Generates an age encryption identity, stored in macOS Keychain.
+  4. Initializes git-crypt and commits the encrypted key to the repo.
+  5. Drops a recovery file at ~/Documents/dotsync-recovery-<date>.txt.
+  6. Prompts which profiles to enable (default: claude-code + project-secrets).
+  7. Installs a launchd agent that auto-syncs every 60 seconds.
+  8. Runs an initial sync.
+
+After this, run 'dotsync join' on your second machine.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repo)            REPO_URL="$2"; shift 2 ;;
+    --branch)          BRANCH="$2"; shift 2 ;;
+    --non-interactive) NON_INTERACTIVE=true; shift ;;
+    --force)           FORCE=true; shift ;;
+    -h|--help)         usage; exit 0 ;;
+    *)                 echo "unknown flag: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+step() { printf '\n→ %s\n' "$*"; }
+say()  { printf '  %s\n' "$*"; }
+fail() { printf '✗ %s\n' "$*" >&2; exit 1; }
+ask()  {
+  $NON_INTERACTIVE && { printf '%s' "$2"; return; }
+  local prompt="$1" default="$2" reply
+  if [[ -n "$default" ]]; then
+    read -rp "$prompt [$default]: " reply
+    printf '%s' "${reply:-$default}"
+  else
+    read -rp "$prompt: " reply
+    printf '%s' "$reply"
+  fi
+}
+
+# ── 1. Preflight ────────────────────────────────────────────────────
+step "Preflight checks"
+
+[[ "$(uname -s)" == "Darwin" ]] || fail "macOS only (Linux support tracked)"
+command -v git  >/dev/null || fail "git required"
+command -v brew >/dev/null || fail "Homebrew required (https://brew.sh/)"
+
+require_or_install() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    say "installing $1"
+    brew install "$1" >/dev/null || fail "brew install $1 failed"
+  fi
+}
+require_or_install gh
+require_or_install git-crypt
+require_or_install age
+require_or_install jq
+require_or_install fswatch
+require_or_install magic-wormhole
+
+# ── 2. Existing-config check ────────────────────────────────────────
+DOTSYNC_CONFIG="${DOTSYNC_CONFIG:-${HOME}/.config/dotsync/config.sh}"
+if [[ -f "$DOTSYNC_CONFIG" ]] && ! $FORCE; then
+  fail "dotsync already initialized at $DOTSYNC_CONFIG. Use --force to overwrite, or 'dotsync join' to add another machine."
+fi
+
+# ── 3. Repo: create via gh or use --repo ────────────────────────────
+step "Repo setup"
+
+DOTSYNC_DATA_DIR="${HOME}/.dotsync-data"
+
+if [[ -z "$REPO_URL" ]]; then
+  # Need gh authenticated.
+  if ! gh auth status >/dev/null 2>&1; then
+    say "gh CLI not authenticated. Running 'gh auth login'…"
+    gh auth login || fail "gh auth login failed"
+  fi
+  gh_user="$(gh api user --jq .login 2>/dev/null)"
+  [[ -n "$gh_user" ]] || fail "could not determine GitHub username"
+
+  default_name="dotsync-data"
+  repo_name="$(ask "Repo name to create (under ${gh_user}/)" "$default_name")"
+
+  full_name="${gh_user}/${repo_name}"
+  REPO_URL="https://github.com/${full_name}.git"
+
+  if gh repo view "$full_name" >/dev/null 2>&1; then
+    if $FORCE; then
+      say "repo $full_name already exists, using as-is"
+    else
+      ans="$(ask "Repo $full_name already exists. Use it? (y/n)" "y")"
+      [[ "$ans" == "y" ]] || fail "refused; pass --repo to use an existing repo without prompting"
+    fi
+  else
+    say "creating private repo $full_name…"
+    gh repo create "$full_name" --private --description "dotsync encrypted data" >/dev/null \
+      || fail "gh repo create failed"
+  fi
+fi
+
+# Clone (or init+push if empty).
+[[ -d "$DOTSYNC_DATA_DIR/.git" ]] && fail "$DOTSYNC_DATA_DIR already exists; rm it first"
+say "cloning $REPO_URL → $DOTSYNC_DATA_DIR"
+if ! git clone "$REPO_URL" "$DOTSYNC_DATA_DIR" --quiet 2>/dev/null; then
+  # Empty repo — init locally and push.
+  mkdir -p "$DOTSYNC_DATA_DIR"
+  git -C "$DOTSYNC_DATA_DIR" init -b "$BRANCH" --quiet
+  git -C "$DOTSYNC_DATA_DIR" remote add origin "$REPO_URL"
+fi
+
+# Switch to / create the branch.
+if ! git -C "$DOTSYNC_DATA_DIR" rev-parse --verify "$BRANCH" >/dev/null 2>&1; then
+  if git -C "$DOTSYNC_DATA_DIR" rev-parse --verify "origin/$BRANCH" >/dev/null 2>&1; then
+    git -C "$DOTSYNC_DATA_DIR" checkout -b "$BRANCH" "origin/$BRANCH" --quiet
+  else
+    git -C "$DOTSYNC_DATA_DIR" checkout -b "$BRANCH" --quiet 2>/dev/null || true
+  fi
+fi
+
+# ── 4. Scaffold the data repo (.gitattributes, .gitignore, README) ─
+cd "$DOTSYNC_DATA_DIR" || fail "cd failed"
+if [[ ! -f .gitattributes ]]; then
+  cat > .gitattributes <<'EOF'
+# Encrypt all user content. Plaintext: registry, README.
+claude-code/**       filter=git-crypt diff=git-crypt
+project-secrets/**   filter=git-crypt diff=git-crypt
+cursor/**            filter=git-crypt diff=git-crypt
+aider/**             filter=git-crypt diff=git-crypt
+
+# Never encrypt these — needed for bootstrap.
+.gitattributes       !filter !diff
+.gitignore           !filter !diff
+README.md            !filter !diff
+registry/**          !filter !diff
+.git-crypt/**        !filter !diff
+EOF
+fi
+[[ -f .gitignore ]] || cat > .gitignore <<'EOF'
+.last-sync
+.sync-paused
+.sync.lock
+EOF
+[[ -f README.md ]] || cat > README.md <<EOF
+# dotsync data repo
+
+Encrypted personal data managed by [dotsync](https://github.com/Voxiven/dotsync).
+Do not edit manually.
+EOF
+mkdir -p registry
+
+# ── 5. Encryption: age identity + git-crypt ─────────────────────────
+step "Encryption setup"
+
+KC_SERVICE="${DOTSYNC_KC_SERVICE:-dev.dotsync.envsync}"
+KC_ACCOUNT="${DOTSYNC_KC_ACCOUNT:-default}"
+RECOVERY_DATE="$(date +%Y-%m-%d)"
+RECOVERY_FILE="${HOME}/Documents/dotsync-recovery-${RECOVERY_DATE}.txt"
+
+# Generate age identity (private key) if Keychain doesn't have one yet.
+if security find-generic-password -s "$KC_SERVICE" -a "$KC_ACCOUNT" -w >/dev/null 2>&1 && ! $FORCE; then
+  say "age identity already in Keychain (service=$KC_SERVICE), reusing"
+  AGE_IDENTITY="$(security find-generic-password -s "$KC_SERVICE" -a "$KC_ACCOUNT" -w 2>/dev/null)"
+else
+  say "generating age identity…"
+  AGE_IDENTITY="$(age-keygen 2>/dev/null | grep -E '^AGE-SECRET-KEY-')"
+  [[ -n "$AGE_IDENTITY" ]] || fail "age-keygen failed"
+  security add-generic-password -s "$KC_SERVICE" -a "$KC_ACCOUNT" -U -w "$AGE_IDENTITY" \
+    || fail "could not store identity in Keychain"
+fi
+
+# Derive public key from identity.
+AGE_PUBKEY="$(printf '%s' "$AGE_IDENTITY" | age-keygen -y 2>/dev/null)"
+[[ "$AGE_PUBKEY" == age1* ]] || fail "could not derive age public key"
+
+# git-crypt init + export + age-encrypt the symmetric key.
+if [[ ! -f .git-crypt/keys/default.age ]]; then
+  say "initializing git-crypt"
+  git-crypt init >/dev/null 2>&1 || fail "git-crypt init failed"
+  raw_key="$(mktemp -t dotsync-gc-key.XXXXXX)"
+  trap 'rm -P "$raw_key" 2>/dev/null || rm -f "$raw_key" 2>/dev/null' EXIT
+  git-crypt export-key "$raw_key" || fail "git-crypt export-key failed"
+  mkdir -p .git-crypt/keys
+  age -r "$AGE_PUBKEY" -o .git-crypt/keys/default.age "$raw_key" || fail "age encryption failed"
+  rm -P "$raw_key" 2>/dev/null || rm -f "$raw_key" 2>/dev/null
+  trap - EXIT
+fi
+
+# Recovery file.
+if [[ ! -f "$RECOVERY_FILE" ]]; then
+  say "writing recovery file: $RECOVERY_FILE"
+  umask 077
+  cat > "$RECOVERY_FILE" <<EOF
+dotsync recovery — generated $(date)
+================================================
+
+Keychain entry:
+  service: $KC_SERVICE
+  account: $KC_ACCOUNT
+
+Age private identity (KEEP SECRET — anyone with this can read your data):
+
+$AGE_IDENTITY
+
+Age public key (safe to share):
+
+$AGE_PUBKEY
+
+Data repo: $REPO_URL
+Branch:    $BRANCH
+
+If you lose access to all your Macs, restore from this file:
+  security add-generic-password -s '$KC_SERVICE' -a '$KC_ACCOUNT' -U -w '<paste identity>'
+  Then run: dotsync join --repo $REPO_URL
+
+Recommended: save this file in 1Password and delete the local copy.
+EOF
+  umask 022
+fi
+
+# ── 6. Profiles ─────────────────────────────────────────────────────
+step "Profile selection"
+
+PROFILES_DIR="$TOOL_DIR/profiles"
+default_profiles="claude-code project-secrets"
+
+if $NON_INTERACTIVE; then
+  enabled="$default_profiles"
+else
+  echo
+  echo "Available profiles:"
+  for p in "$PROFILES_DIR"/*.json; do
+    name=$(jq -r '.name' "$p")
+    desc=$(jq -r '.description' "$p")
+    exp=$(jq -r '.experimental // false' "$p")
+    tag=""; [[ "$exp" == "true" ]] && tag=" (experimental)"
+    printf '    %-20s %s%s\n' "$name" "$desc" "$tag"
+  done
+  echo
+  enabled="$(ask "Enable (space-separated, or 'all')" "$default_profiles")"
+  if [[ "$enabled" == "all" ]]; then
+    enabled="$(jq -r '.name' "$PROFILES_DIR"/*.json | tr '\n' ' ')"
+  fi
+fi
+
+# Persist enabled list in the data repo so it syncs across machines.
+mkdir -p registry
+jq -n --arg list "$enabled" '{profiles: ($list | split(" ") | map(select(length > 0)))}' \
+  > registry/enabled-profiles.json
+
+# ── 7. Project root + projects.json ─────────────────────────────────
+step "Project root"
+
+# Detect: pick the parent dir with the most git repos.
+detect_project_root() {
+  for candidate in "$HOME/code" "$HOME/dev" "$HOME/Workspace" "$HOME/projects" "$HOME/LearnToCode/GamesProject"; do
+    [[ -d "$candidate" ]] || continue
+    count=$(find "$candidate" -mindepth 2 -maxdepth 2 -name '.git' -type d 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$count" -gt 0 ]]; then
+      printf '%s\t%d' "$candidate" "$count"
+      return
+    fi
+  done
+}
+
+detected="$(detect_project_root)"
+if [[ -n "$detected" ]]; then
+  detected_path="${detected%%$'\t'*}"
+  detected_count="${detected##*$'\t'}"
+  say "detected: $detected_path ($detected_count git repos)"
+  PROJECT_ROOT="$(ask "Project root for this machine" "$detected_path")"
+else
+  PROJECT_ROOT="$(ask "Project root for this machine" "$HOME")"
+fi
+
+# Build projects.json from git repos under PROJECT_ROOT.
+if [[ ! -f registry/projects.json ]]; then
+  say "scanning $PROJECT_ROOT for git repos…"
+  projects_json='{"version":2,"projects":[]}'
+  while IFS= read -r repo; do
+    name="$(basename "$(dirname "$repo")")"
+    projects_json=$(echo "$projects_json" | jq --arg n "$name" '.projects += [{"name":$n,"label":$n}]')
+  done < <(find "$PROJECT_ROOT" -mindepth 2 -maxdepth 2 -name '.git' -type d 2>/dev/null)
+  echo "$projects_json" | jq . > registry/projects.json
+  count=$(jq -r '.projects | length' registry/projects.json)
+  say "registered $count project(s)"
+fi
+
+# Empty secrets registry — user adds via 'dotsync track'.
+[[ -f registry/secrets.json ]] || echo '{"secrets":[]}' > registry/secrets.json
+
+# ── 8. Save dotsync config ──────────────────────────────────────────
+step "Writing config"
+
+mkdir -p "$(dirname "$DOTSYNC_CONFIG")"
+cat > "$DOTSYNC_CONFIG" <<EOF
+# dotsync config — generated by dotsync init on $(date -u +%Y-%m-%dT%H:%M:%SZ)
+DOTSYNC_DATA_DIR="${DOTSYNC_DATA_DIR}"
+DOTSYNC_DATA_REMOTE="${REPO_URL}"
+DOTSYNC_DATA_BRANCH="${BRANCH}"
+DOTSYNC_KC_SERVICE="${KC_SERVICE}"
+DOTSYNC_KC_ACCOUNT="${KC_ACCOUNT}"
+DOTSYNC_PROJECT_ROOT="${PROJECT_ROOT}"
+DOTSYNC_SESSION_MAX_MB=50
+DOTSYNC_SKIP_PROJECTS=""
+EOF
+say "wrote $DOTSYNC_CONFIG"
+
+# ── 9. Initial commit + push ────────────────────────────────────────
+step "Initial commit"
+git add .gitattributes .gitignore README.md registry/ .git-crypt/ 2>/dev/null
+if [[ -n "$(git status --porcelain)" ]]; then
+  git -c user.name="$(git config user.name)" -c user.email="$(git config user.email)" \
+    commit -m "dotsync init — encrypted data scaffold" --quiet \
+    || fail "initial commit failed"
+fi
+say "pushing to origin/$BRANCH"
+git push -u origin "$BRANCH" --quiet 2>/dev/null \
+  || git push origin "$BRANCH" --quiet \
+  || fail "push failed"
+
+# ── 10. Daemon ──────────────────────────────────────────────────────
+step "Installing launchd agent"
+LABEL="$KC_SERVICE"
+plist_dest="$HOME/Library/LaunchAgents/${LABEL}.plist"
+mkdir -p "$(dirname "$plist_dest")"
+sed \
+  -e "s|__LABEL__|$LABEL|g" \
+  -e "s|__TOOL_DIR__|$TOOL_DIR|g" \
+  -e "s|__DATA_DIR__|$DOTSYNC_DATA_DIR|g" \
+  -e "s|__HOME__|$HOME|g" \
+  -e "s|__CONFIG__|$DOTSYNC_CONFIG|g" \
+  "$TOOL_DIR/launchd/dev.dotsync.envsync.plist.template" > "$plist_dest"
+plutil -lint "$plist_dest" >/dev/null || fail "plist invalid"
+launchctl unload "$plist_dest" 2>/dev/null || true
+launchctl load -w "$plist_dest" || fail "launchctl load failed"
+say "loaded $plist_dest"
+
+# ── 11. Done ────────────────────────────────────────────────────────
+cat <<EOF
+
+✅ dotsync ready.
+
+  Repo:     $REPO_URL ($BRANCH)
+  Profiles: $enabled
+  Daemon:   running (every 60s)
+  Recovery: $RECOVERY_FILE  ← save this in 1Password, then delete the local copy
+
+To add a second machine, run on it:
+
+  dotsync join --repo $REPO_URL
+
+It will ask for a pairing code; come back here and run:
+
+  dotsync pair
+
+EOF
