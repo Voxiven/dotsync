@@ -16,9 +16,22 @@ secrets_pairs() {
       done
 }
 
-# Emit one encoded project name per line.
+# Emit one Claude Code-encoded project name per line.
+# Schema v2: projects[].name is the project DIRECTORY name (e.g. "Omphalis").
+# Encoded name is derived from $DOTSYNC_PROJECT_ROOT/<name> per local machine
+# by replacing '/' with '-' (matches Claude Code's encoding scheme).
+# Falls back to legacy v1 .encoded field if version < 2.
 project_names() {
-  jq -r '.projects[].encoded' "$PROJECTS_REGISTRY"
+  local proot="${DOTSYNC_PROJECT_ROOT:-$HOME}"
+  local version
+  version="$(jq -r '.version // 1' "$PROJECTS_REGISTRY")"
+  if [[ "$version" -ge 2 ]]; then
+    jq -r '.projects[].name' "$PROJECTS_REGISTRY" | while read -r name; do
+      echo "${proot}/${name}" | tr '/' '-'
+    done
+  else
+    jq -r '.projects[].encoded' "$PROJECTS_REGISTRY"
+  fi
 }
 
 # Add a secret idempotently (silent skip if repo_path already present).

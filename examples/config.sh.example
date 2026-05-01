@@ -15,6 +15,12 @@ DOTSYNC_DATA_BRANCH="main"
 DOTSYNC_KC_SERVICE="dev.dotsync.envsync"
 DOTSYNC_KC_ACCOUNT="default"
 
+# Where source-code projects live on THIS machine. Used to expand
+# ${PROJECT_ROOT} in registry/secrets.json paths and to derive Claude
+# Code's per-project encoded names. Differs per machine.
+# Example: "${HOME}/code", "${HOME}/Workspace", "${HOME}/dev"
+DOTSYNC_PROJECT_ROOT="${HOME}"
+
 # Skip session JSONLs above this size (MB). GitHub rejects files >100MB.
 # 50 is a safe default — files this big are usually degenerate sessions
 # (large file reads, image captures) where cross-machine resume is rare.

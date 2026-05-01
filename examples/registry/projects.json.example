@@ -1,9 +1,7 @@
 {
-  "version": 1,
+  "version": 2,
   "projects": [
-    {
-      "encoded": "-Users-yourname-code-myproject",
-      "label": "My Project"
-    }
+    { "name": "myproject",     "label": "My Project" },
+    { "name": "anotherproject", "label": "Another Project" }
   ]
 }

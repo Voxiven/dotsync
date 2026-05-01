@@ -47,8 +47,14 @@ notify_user() {
   osascript -e "display notification \"${body//\"/\\\"}\" with title \"${title//\"/\\\"}\"" 2>/dev/null || true
 }
 
-# Expand ${HOME} (and only ${HOME}) in a path string from the registry.
+# Expand ${HOME} and ${PROJECT_ROOT} in a path string from the registry.
+# PROJECT_ROOT is the per-machine base where source code projects live.
+# Default: $HOME (i.e. registry paths are relative to home if PROJECT_ROOT
+# isn't set in config).
 expand_path() {
   local p="$1"
-  echo "${p//\$\{HOME\}/$HOME}"
+  local proot="${DOTSYNC_PROJECT_ROOT:-$HOME}"
+  p="${p//\$\{HOME\}/$HOME}"
+  p="${p//\$\{PROJECT_ROOT\}/$proot}"
+  echo "$p"
 }
