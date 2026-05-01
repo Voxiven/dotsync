@@ -22,8 +22,8 @@
 class Dotsync < Formula
   desc "Multi-machine continuity for Claude Code and other AI dev tools"
   homepage "https://github.com/Voxiven/dotsync"
-  url "https://github.com/Voxiven/dotsync/archive/refs/tags/v0.5.2.tar.gz"
-  sha256 "f1a0577f8a035722be06aad99d1e84b67a29732a1041b3ee3570d5322c6dc1d1"
+  url "https://github.com/Voxiven/dotsync/archive/refs/tags/v0.6.0.tar.gz"
+  sha256 "27d4d5c0e98cca9e1af472375e199fd15133af4cfcdd25d6f9f7ec410bb7d3b1"
   license "MIT"
 
   depends_on "fswatch"
@@ -65,7 +65,7 @@ class Dotsync < Formula
 
   test do
     assert_match "multi-machine continuity", shell_output("#{bin}/dotsync --help")
-    assert_match "dotsync 0.5", shell_output("#{bin}/dotsync version")
+    assert_match(/dotsync \d+\.\d+\.\d+/, shell_output("#{bin}/dotsync version"))
     assert_match "claude-code", shell_output("#{bin}/dotsync profiles 2>&1")
   end
 end
