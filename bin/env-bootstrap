@@ -68,26 +68,27 @@ fi
 source "$DOTSYNC_CONFIG"
 DOTSYNC_DATA_DIR="${DOTSYNC_DATA_DIR:?DOTSYNC_DATA_DIR not set in $DOTSYNC_CONFIG}"
 DOTSYNC_DATA_REMOTE="${DOTSYNC_DATA_REMOTE:?DOTSYNC_DATA_REMOTE not set in $DOTSYNC_CONFIG}"
+DOTSYNC_DATA_BRANCH="${DOTSYNC_DATA_BRANCH:-main}"
 DOTSYNC_KC_SERVICE="${DOTSYNC_KC_SERVICE:-dev.dotsync.envsync}"
 DOTSYNC_KC_ACCOUNT="${DOTSYNC_KC_ACCOUNT:-default}"
 
 BACKUP_DIR="${HOME}/.dotsync-backup-$(date -u +%Y%m%dT%H%M%SZ)"
 
-# 4. Clone or update the data repo.
+# 4. Clone or update the data repo. Always operate on $DOTSYNC_DATA_BRANCH —
+# the data branch may be an orphan (no shared history with the remote's
+# default branch), so we must never fall back to whatever HEAD points at.
 if [[ -d "$DOTSYNC_DATA_DIR/.git" ]]; then
-  step "Data repo exists at $DOTSYNC_DATA_DIR — fetching latest"
-  git -C "$DOTSYNC_DATA_DIR" fetch origin --quiet || fail "fetch failed"
-  default_branch="$(git -C "$DOTSYNC_DATA_DIR" rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null \
-    | sed 's|origin/||')"
-  default_branch="${default_branch:-main}"
-  git -C "$DOTSYNC_DATA_DIR" checkout "$default_branch" --quiet 2>/dev/null \
-    || fail "could not check out $default_branch"
-  git -C "$DOTSYNC_DATA_DIR" merge --ff-only "origin/$default_branch" --quiet 2>/dev/null \
+  step "Data repo exists at $DOTSYNC_DATA_DIR — fetching latest $DOTSYNC_DATA_BRANCH"
+  git -C "$DOTSYNC_DATA_DIR" fetch origin "$DOTSYNC_DATA_BRANCH" --quiet \
+    || fail "fetch of $DOTSYNC_DATA_BRANCH failed"
+  git -C "$DOTSYNC_DATA_DIR" checkout "$DOTSYNC_DATA_BRANCH" --quiet 2>/dev/null \
+    || fail "could not check out $DOTSYNC_DATA_BRANCH"
+  git -C "$DOTSYNC_DATA_DIR" merge --ff-only "origin/$DOTSYNC_DATA_BRANCH" --quiet 2>/dev/null \
     || step "(local has unpushed commits; leaving them alone)"
 else
-  step "Cloning $DOTSYNC_DATA_REMOTE → $DOTSYNC_DATA_DIR"
-  git clone "$DOTSYNC_DATA_REMOTE" "$DOTSYNC_DATA_DIR" --quiet \
-    || fail "clone of data repo failed"
+  step "Cloning $DOTSYNC_DATA_REMOTE ($DOTSYNC_DATA_BRANCH) → $DOTSYNC_DATA_DIR"
+  git clone -b "$DOTSYNC_DATA_BRANCH" "$DOTSYNC_DATA_REMOTE" "$DOTSYNC_DATA_DIR" --quiet \
+    || fail "clone of data repo failed (branch: $DOTSYNC_DATA_BRANCH)"
 fi
 
 # 5. Source helpers (now that DOTSYNC_DATA_DIR exists and tool dir is known).
