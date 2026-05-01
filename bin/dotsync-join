@@ -36,7 +36,7 @@ ENGINE="${ENGINE:-syncthing}"
 $HELP_REQUESTED && ARGS+=("--help")
 
 case "$ENGINE" in
-  syncthing) exec "$SCRIPT_DIR/dotsync-join-syncthing" "${ARGS[@]}" ;;
-  git)       exec "$SCRIPT_DIR/dotsync-join-git" "${ARGS[@]}" ;;
+  syncthing) exec "$SCRIPT_DIR/dotsync-join-syncthing" ${ARGS[@]+"${ARGS[@]}"} ;;
+  git)       exec "$SCRIPT_DIR/dotsync-join-git" ${ARGS[@]+"${ARGS[@]}"} ;;
   *) echo "✗ unknown engine: $ENGINE" >&2; exit 1 ;;
 esac

@@ -50,10 +50,10 @@ $HELP_REQUESTED && ARGS+=("--help")
 
 case "$ENGINE" in
   syncthing)
-    exec "$SCRIPT_DIR/dotsync-init-syncthing" "${ARGS[@]}"
+    exec "$SCRIPT_DIR/dotsync-init-syncthing" ${ARGS[@]+"${ARGS[@]}"}
     ;;
   git)
-    exec "$SCRIPT_DIR/dotsync-init-git" "${ARGS[@]}"
+    exec "$SCRIPT_DIR/dotsync-init-git" ${ARGS[@]+"${ARGS[@]}"}
     ;;
   *)
     echo "✗ unknown engine: $ENGINE (must be 'git' or 'syncthing')" >&2
