@@ -121,6 +121,140 @@ JSON
   [[ -L "$src" ]]
 }
 
+# Helper: emit a session_jsonls profile pointing at $src (a project-local
+# sessions dir) and into $repo_subpath inside DOTSYNC_DATA_DIR.
+_write_sessions_profile() {
+  local src="$1" repo_subpath="$2"
+  cat > "$TEST_PROFILE_DIR/test.json" <<JSON
+{"name":"test","schema_version":2,"iterates_per_project":false,
+ "paths":[{"id":"sessions","type":"session_jsonls",
+           "from":"${src}/","to":"${repo_subpath}/",
+           "max_file_mb":50}]}
+JSON
+  echo '{"profiles":["test"]}' > "$ENABLED_PROFILES_FILE"
+}
+
+@test "session_jsonls: capture skips active session (mtime within idle threshold)" {
+  src="$HOME/.claude/projects/test"
+  mkdir -p "$src"
+  echo '{"line":1}' > "$src/active-session.jsonl"
+  # mtime is now (just created) → within default 300s idle threshold
+  _write_sessions_profile "$src" "test/sessions"
+
+  profile_run "test" capture
+
+  [[ ! -f "$DOTSYNC_DATA_DIR/test/sessions/active-session.jsonl" ]]
+}
+
+@test "session_jsonls: capture catches idle session (mtime older than threshold)" {
+  src="$HOME/.claude/projects/test"
+  mkdir -p "$src"
+  echo '{"line":1}' > "$src/idle-session.jsonl"
+  # Backdate mtime to 1 hour ago (well past 300s default threshold).
+  touch -t "$(date -v-1H +%Y%m%d%H%M)" "$src/idle-session.jsonl"
+  _write_sessions_profile "$src" "test/sessions"
+
+  profile_run "test" capture
+
+  [[ -f "$DOTSYNC_DATA_DIR/test/sessions/idle-session.jsonl" ]]
+}
+
+@test "session_jsonls: capture honors DOTSYNC_SESSION_IDLE_THRESHOLD override" {
+  src="$HOME/.claude/projects/test"
+  mkdir -p "$src"
+  echo '{"line":1}' > "$src/recent.jsonl"
+  # Just-created file. With threshold=0 it should be treated as idle.
+  _write_sessions_profile "$src" "test/sessions"
+
+  DOTSYNC_SESSION_IDLE_THRESHOLD=0 profile_run "test" capture
+
+  [[ -f "$DOTSYNC_DATA_DIR/test/sessions/recent.jsonl" ]]
+}
+
+@test "session_jsonls: capture skips sync-conflict sidecars in source" {
+  src="$HOME/.claude/projects/test"
+  mkdir -p "$src"
+  echo '{"line":1}' > "$src/abc.jsonl"
+  echo '{"line":2}' > "$src/abc.sync-conflict-20260501-203217-XA7N5BU.jsonl"
+  touch -t "$(date -v-1H +%Y%m%d%H%M)" "$src/abc.jsonl" "$src/abc.sync-conflict-20260501-203217-XA7N5BU.jsonl"
+  _write_sessions_profile "$src" "test/sessions"
+
+  profile_run "test" capture
+
+  [[ -f "$DOTSYNC_DATA_DIR/test/sessions/abc.jsonl" ]]
+  [[ ! -f "$DOTSYNC_DATA_DIR/test/sessions/abc.sync-conflict-20260501-203217-XA7N5BU.jsonl" ]]
+}
+
+@test "session_jsonls: deploy preserves active local session (local newer than data dir)" {
+  src="$HOME/.claude/projects/test"
+  mkdir -p "$src"
+  repo="$DOTSYNC_DATA_DIR/test/sessions"
+  mkdir -p "$repo"
+
+  # Older version in the data dir (would arrive via Syncthing from a peer).
+  echo '{"line":"old"}' > "$repo/contested.jsonl"
+  touch -t "$(date -v-1H +%Y%m%d%H%M)" "$repo/contested.jsonl"
+
+  # Newer local version (CC actively writing).
+  echo '{"line":"local-active"}' > "$src/contested.jsonl"
+  # mtime is now → newer than data dir's mtime
+  _write_sessions_profile "$src" "test/sessions"
+
+  profile_run "test" deploy
+
+  [[ "$(cat "$src/contested.jsonl")" == '{"line":"local-active"}' ]]
+}
+
+@test "session_jsonls: deploy overwrites local when data dir is newer" {
+  src="$HOME/.claude/projects/test"
+  mkdir -p "$src"
+  repo="$DOTSYNC_DATA_DIR/test/sessions"
+  mkdir -p "$repo"
+
+  # Older local version.
+  echo '{"line":"local-old"}' > "$src/closed.jsonl"
+  touch -t "$(date -v-1H +%Y%m%d%H%M)" "$src/closed.jsonl"
+
+  # Newer data-dir version (peer just sent us the closed session).
+  echo '{"line":"peer-fresh"}' > "$repo/closed.jsonl"
+  _write_sessions_profile "$src" "test/sessions"
+
+  profile_run "test" deploy
+
+  [[ "$(cat "$src/closed.jsonl")" == '{"line":"peer-fresh"}' ]]
+}
+
+@test "session_jsonls: deploy excludes sync-conflict sidecars from data dir" {
+  src="$HOME/.claude/projects/test"
+  mkdir -p "$src"
+  repo="$DOTSYNC_DATA_DIR/test/sessions"
+  mkdir -p "$repo"
+  echo '{"line":1}' > "$repo/abc.jsonl"
+  echo '{"line":2}' > "$repo/abc.sync-conflict-20260501-203217-XA7N5BU.jsonl"
+  _write_sessions_profile "$src" "test/sessions"
+
+  profile_run "test" deploy
+
+  [[ -f "$src/abc.jsonl" ]]
+  [[ ! -f "$src/abc.sync-conflict-20260501-203217-XA7N5BU.jsonl" ]]
+}
+
+@test "session_jsonls: deploy cleans up legacy sidecar already in destination" {
+  src="$HOME/.claude/projects/test"
+  mkdir -p "$src"
+  repo="$DOTSYNC_DATA_DIR/test/sessions"
+  mkdir -p "$repo"
+  echo '{"line":1}' > "$repo/abc.jsonl"
+  # Pre-existing legacy sidecar in $src from a 0.5.x deploy.
+  echo '{"stale":1}' > "$src/abc.sync-conflict-20260501-203217-XA7N5BU.jsonl"
+  _write_sessions_profile "$src" "test/sessions"
+
+  profile_run "test" deploy
+
+  [[ -f "$src/abc.jsonl" ]]
+  [[ ! -f "$src/abc.sync-conflict-20260501-203217-XA7N5BU.jsonl" ]]
+}
+
 @test "profile_mode_active: false when enabled-profiles.json missing" {
   rm -f "$ENABLED_PROFILES_FILE"
   ! profile_mode_active

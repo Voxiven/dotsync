@@ -219,6 +219,13 @@ _profile_path_session_jsonls() {
   local action="$1" from="$2" to="$3" max_mb="$4"
   local repo_full="$ENV_REPO_ROOT/$to"
   local skip="${DOTSYNC_SKIP_PROJECTS:-}"
+  # Sessions modified more recently than this are "active" and stay
+  # local — only captured/deployed once the writer has paused. This
+  # prevents the dual-machine same-session conflict storm: when both
+  # peers append to the same active JSONL, Syncthing creates a sidecar
+  # every few seconds and no merge cadence can keep up. Idle-gating
+  # means convergence only happens once per close, not per write.
+  local idle_secs="${DOTSYNC_SESSION_IDLE_THRESHOLD:-300}"
 
   # Honor skip list — if to-path's last segment matches a skip token,
   # don't capture or deploy.
@@ -234,16 +241,45 @@ _profile_path_session_jsonls() {
     capture)
       [[ -d "${from%/}" ]] || return 0
       mkdir -p "$repo_full"
-      find "${from%/}" -maxdepth 1 -name '*.jsonl' -size "-${max_mb}M" 2>/dev/null \
+      local now epoch_cutoff
+      now=$(date +%s)
+      epoch_cutoff=$((now - idle_secs))
+      # Skip active sessions (mtime within $idle_secs) and any
+      # sync-conflict sidecars that may have leaked into the source dir
+      # from earlier 0.5.x deploys.
+      find "${from%/}" -maxdepth 1 -name '*.jsonl' -size "-${max_mb}M" \
+        ! -name '*.sync-conflict-*' 2>/dev/null \
         | while read -r jf; do
+            local mt
+            mt=$(stat -f '%m' "$jf" 2>/dev/null || echo 0)
+            [[ "$mt" -gt "$epoch_cutoff" ]] && continue
             rsync -a --checksum "$jf" "$repo_full/$(basename "$jf")"
           done
       ;;
     deploy)
       [[ -d "${repo_full%/}" ]] || return 0
       mkdir -p "${from%/}"
-      rsync -a --checksum --include='*.jsonl' --exclude='*' \
-        "${repo_full%/}/" "${from%/}/"
+      # Per-file deploy: only overwrite local if the data-dir copy is
+      # newer or local doesn't exist. Protects an active local session
+      # from being clobbered by stale state replicated from a peer.
+      # Also excludes sync-conflict sidecars — they'd otherwise show up
+      # in CC's session picker as ghost resumable sessions.
+      find "${repo_full%/}" -maxdepth 1 -name '*.jsonl' \
+        ! -name '*.sync-conflict-*' 2>/dev/null \
+        | while read -r src; do
+            local dst="${from%/}/$(basename "$src")"
+            if [[ -f "$dst" ]]; then
+              local src_mt dst_mt
+              src_mt=$(stat -f '%m' "$src" 2>/dev/null || echo 0)
+              dst_mt=$(stat -f '%m' "$dst" 2>/dev/null || echo 0)
+              [[ "$dst_mt" -gt "$src_mt" ]] && continue
+            fi
+            rsync -a --checksum "$src" "$dst"
+          done
+      # Cleanup: any sidecar left over in $from from earlier 0.5.x
+      # deploys gets removed. Idempotent — safe to run every cycle.
+      find "${from%/}" -maxdepth 1 -name '*.sync-conflict-*.jsonl' -type f \
+        -delete 2>/dev/null || true
       ;;
   esac
 }

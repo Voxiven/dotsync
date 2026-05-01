@@ -39,11 +39,14 @@ deploy_secrets() {
   done < <(secrets_pairs)
 }
 
-# Auto-merge any *.sync-conflict-* sidecars Syncthing has produced.
-# Runs every cycle so conflicts never pile up — for JSONL files (Claude
-# Code session logs), line-union merge is safe and lossless: both peers'
-# entries end up in the canonical file. Non-JSONL conflicts are left
-# alone (need human review). Quiet when there's nothing to do.
+# Safety net for the rare cross-peer divergence on a session file that
+# went idle on both peers and got merged into different shapes — the
+# session-jsonls capture is now idle-gated (0.6.0+), so most active
+# divergences never produce sidecars in the first place. When sidecars
+# DO appear (e.g. settings.json edited on both peers, or a session that
+# closed on one peer and was reopened on the other), the JSONL ones
+# line-union merge losslessly and non-JSONL ones are left for human
+# review. Quiet when there's nothing to do.
 auto_merge_conflicts() {
   local first_sidecar
   first_sidecar=$(find "$ENV_REPO_ROOT" -name '*.sync-conflict-*' -type f 2>/dev/null | head -1)
