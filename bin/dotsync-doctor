@@ -177,7 +177,49 @@ else
     "run 'dotsync setup-symlinks' to write it"
 fi
 
-# ── 4. Profile + symlinks ────────────────────────────────────────────
+# ── 4. Cross-network sync ────────────────────────────────────────────
+# These flags are what let pairing + sync work across networks (different
+# WiFi, cellular, behind NAT, etc.) without needing same-LAN. Disabling
+# any of them turns dotsync back into a same-LAN-only tool.
+if st_running; then
+  section "Cross-network sync"
+  opts_resp=$(_st_curl GET "/rest/config/options" 2>/dev/null || true)
+  if [[ -n "$opts_resp" ]]; then
+    ga=$(echo "$opts_resp" | jq -r '.globalAnnounceEnabled // false' 2>/dev/null)
+    rl=$(echo "$opts_resp" | jq -r '.relaysEnabled // false' 2>/dev/null)
+    nt=$(echo "$opts_resp" | jq -r '.natEnabled // false' 2>/dev/null)
+
+    if [[ "$ga" == "true" ]]; then
+      check PASS "global discovery" "enabled (peers find each other across networks)"
+    else
+      check WARN "global discovery" "disabled" \
+        "in Syncthing UI: Settings → Connections → Enable Global Discovery"
+    fi
+    if [[ "$rl" == "true" ]]; then
+      check PASS "public relays" "enabled (TLS fallback when direct connect fails)"
+    else
+      check WARN "public relays" "disabled" \
+        "in Syncthing UI: Settings → Connections → Enable Relaying"
+    fi
+    if [[ "$nt" == "true" ]]; then
+      check PASS "NAT traversal" "enabled (UPnP + hole-punching)"
+    else
+      check WARN "NAT traversal" "disabled" \
+        "in Syncthing UI: Settings → Connections → Enable NAT Traversal"
+    fi
+  fi
+
+  # cloudflared — needed for `dotsync ui --share`. Optional, hence INFO/WARN.
+  if command -v cloudflared >/dev/null 2>&1; then
+    cf_ver=$(cloudflared --version 2>&1 | head -1 | awk '{print $3}')
+    check PASS "cloudflared" "${cf_ver:-installed} (enables 'dotsync ui --share')"
+  else
+    check WARN "cloudflared" "not installed (optional)" \
+      "needed for 'dotsync ui --share' remote dashboard. Install: brew install cloudflared"
+  fi
+fi
+
+# ── 5. Profile + symlinks ────────────────────────────────────────────
 section "Profiles + symlinks"
 
 ENABLED_FILE="$DOTSYNC_DATA_DIR/registry/enabled-profiles.json"
