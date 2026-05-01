@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+set -uo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/_common.sh"
+source "$SCRIPT_DIR/_crypt.sh"
+source "$SCRIPT_DIR/_registry.sh"
+
+deploy_secrets() {
+  local repo_p real_p
+  while IFS=$'\t' read -r repo_p real_p; do
+    [[ -f "$ENV_REPO_ROOT/$repo_p" ]] || continue
+    mkdir -p "$(dirname "$real_p")"
+    rsync -a --checksum "$ENV_REPO_ROOT/$repo_p" "$real_p"
+  done < <(secrets_pairs)
+}
+
+capture_secrets() {
+  local repo_p real_p
+  while IFS=$'\t' read -r repo_p real_p; do
+    [[ -f "$real_p" ]] || continue
+    mkdir -p "$(dirname "$ENV_REPO_ROOT/$repo_p")"
+    rsync -a --checksum "$real_p" "$ENV_REPO_ROOT/$repo_p"
+  done < <(secrets_pairs)
+}
+
+deploy_sessions() {
+  local proj
+  while read -r proj; do
+    local src="$ENV_REPO_ROOT/sessions/$proj"
+    local dst="$HOME/.claude/projects/$proj"
+    [[ -d "$src" ]] || continue
+    mkdir -p "$dst"
+    rsync -a --checksum --include='*.jsonl' --exclude='*' "$src/" "$dst/"
+  done < <(project_names)
+}
+
+capture_sessions() {
+  local proj
+  while read -r proj; do
+    local src="$HOME/.claude/projects/$proj"
+    local dst="$ENV_REPO_ROOT/sessions/$proj"
+    [[ -d "$src" ]] || continue
+    mkdir -p "$dst"
+    rsync -a --checksum --include='*.jsonl' --exclude='*' "$src/" "$dst/"
+  done < <(project_names)
+}
+
+handle_conflict() {
+  local ts; ts="$(date -u +%Y%m%dT%H%M%SZ)"
+  local conflict_dir="$ENV_CONFLICTS_DIR/$ts"
+  mkdir -p "$conflict_dir"
+  local conflicted_files
+  conflicted_files="$(git diff --name-only --diff-filter=U)"
+  # Smudge through git-crypt to produce plaintext conflict files.
+  # git show extracts the encrypted blob; piping to `git-crypt smudge` decrypts
+  # it when the repo is unlocked. Falls back to the raw blob if smudge fails.
+  _smudge_blob() {
+    local stage="$1" path="$2" out="$3"
+    git show ":${stage}:${path}" 2>/dev/null \
+      | git-crypt smudge 2>/dev/null \
+      > "$out" || git show ":${stage}:${path}" > "$out" 2>/dev/null || true
+  }
+  # During `git rebase origin/"$DOTSYNC_DATA_BRANCH"`:
+  #   stage 1 = common ancestor (base)
+  #   stage 2 = ours = origin/"$DOTSYNC_DATA_BRANCH" = the REMOTE version
+  #   stage 3 = theirs = local commit being replayed = the LOCAL version
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    _smudge_blob 1 "$f" "$conflict_dir/$(basename "$f").base"
+    _smudge_blob 3 "$f" "$conflict_dir/$(basename "$f").local"
+    _smudge_blob 2 "$f" "$conflict_dir/$(basename "$f").remote"
+  done <<< "$conflicted_files"
+  git rebase --abort 2>/dev/null || true
+  set_paused
+  notify_user "Dev-env sync paused" "Conflict in: $(echo "$conflicted_files" | tr '\n' ' '). Run env-resolve."
+  log_error "conflict in: $conflicted_files (saved to $conflict_dir)"
+}
+
+# --- main ---
+if is_paused; then
+  log_warn "sync paused (.sync-paused exists); run env-resolve"
+  exit 0
+fi
+
+unlock_repo
+cd "$ENV_REPO_ROOT" || die "cannot cd to $ENV_REPO_ROOT"
+
+git fetch origin "$DOTSYNC_DATA_BRANCH" --quiet || die "git fetch failed"
+
+local_sha="$(git rev-parse HEAD)"
+remote_sha="$(git rev-parse origin/"$DOTSYNC_DATA_BRANCH")"
+
+if [[ "$local_sha" != "$remote_sha" ]]; then
+  if git merge-base --is-ancestor "$local_sha" "$remote_sha"; then
+    log_info "fast-forward to $remote_sha"
+    git merge --ff-only "$remote_sha" --quiet
+  else
+    log_info "diverged; rebasing"
+    if ! git rebase origin/"$DOTSYNC_DATA_BRANCH" --quiet; then
+      handle_conflict
+      exit 2
+    fi
+  fi
+fi
+
+deploy_secrets
+deploy_sessions
+capture_secrets
+capture_sessions
+
+if [[ -n "$(git status --porcelain)" ]]; then
+  git add -A
+  git commit -m "auto-sync $(hostname -s) $(date -u +%Y-%m-%dT%H:%M:%SZ)" --quiet \
+    || die "commit failed"
+  if ! git push origin "$DOTSYNC_DATA_BRANCH" --quiet 2>/dev/null; then
+    log_warn "push rejected; fetching + rebasing"
+    git fetch origin "$DOTSYNC_DATA_BRANCH" --quiet
+    if ! git rebase origin/"$DOTSYNC_DATA_BRANCH" --quiet; then
+      handle_conflict
+      exit 2
+    fi
+    git push origin "$DOTSYNC_DATA_BRANCH" --quiet || die "push failed after rebase"
+  fi
+  log_info "pushed local changes"
+fi
+
+date -u +%Y-%m-%dT%H:%M:%SZ > "$ENV_LASTSYNC_FILE"
+log_info "sync complete"

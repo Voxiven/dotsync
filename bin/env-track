@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+set -uo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/_common.sh"
+source "$SCRIPT_DIR/_crypt.sh"
+source "$SCRIPT_DIR/_registry.sh"
+
+[[ $# -eq 1 ]] || die "usage: env-track <absolute-path-to-env-file>"
+
+real_path="$1"
+[[ "$real_path" == /* ]] || die "path must be absolute: $real_path"
+[[ -f "$real_path" ]] || die "file not found: $real_path"
+
+# Derive a sensible repo_path: <last-two-path-segments>.<filename-without-leading-dot>
+parent_dir="$(dirname "$real_path")"
+parent_segments="$(basename "$(dirname "$parent_dir")").$(basename "$parent_dir")"
+filename="$(basename "$real_path")"
+filename_no_dot="${filename#.}"
+repo_basename="${parent_segments}.${filename_no_dot}"
+
+# If the file is directly under one parent (not nested), simplify the prefix.
+# Heuristic: if the basename of the parent equals the project root name, use just that.
+# Keep simple: trust the two-segment derivation; it's predictable.
+repo_path="secrets/${repo_basename}"
+
+# Templatize the real_path using ${HOME} for portability.
+templated_path="${real_path/#$HOME/\$\{HOME\}}"
+
+unlock_repo
+mkdir -p "$ENV_REPO_ROOT/secrets"
+cp "$real_path" "$ENV_REPO_ROOT/$repo_path"
+registry_add_secret "$repo_path" "$templated_path"
+
+cd "$ENV_REPO_ROOT"
+git add "registry/secrets.json" "$repo_path"
+git commit -m "track $repo_basename"
+
+log_info "tracked $real_path → $repo_path"
+echo "Tracked. Run 'env-sync' to push."

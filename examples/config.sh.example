@@ -1,0 +1,16 @@
+# dotsync config — copy to ~/.config/dotsync/config.sh
+# All values shown here are defaults; only set what you need to override.
+
+# Where the encrypted data repo lives on disk.
+DOTSYNC_DATA_DIR="${HOME}/.dotsync-data"
+
+# Git remote for your data repo (private; you create this).
+# Example: "git@github.com:yourname/dotsync-data.git"
+DOTSYNC_DATA_REMOTE=""
+
+# Branch in the data repo to track.
+DOTSYNC_DATA_BRANCH="main"
+
+# macOS Keychain entry that holds your age identity (private key).
+DOTSYNC_KC_SERVICE="dev.dotsync.envsync"
+DOTSYNC_KC_ACCOUNT="default"
