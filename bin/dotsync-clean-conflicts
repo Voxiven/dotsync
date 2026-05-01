@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# dotsync-clean-conflicts — remove Syncthing's *.sync-conflict-* files.
+# dotsync-clean-conflicts — remove or merge Syncthing's *.sync-conflict-* files.
 #
-# Syncthing creates these when both peers edit the same file. dotsync's
-# .stignore should prevent them on per-machine state files going forward,
-# but historical ones (and conflicts on real user content) need explicit
-# cleanup.
+# Three classes of conflict:
+#   1. INTERNAL — dotsync per-machine state files (.last-sync, .sync-paused,
+#      .sync.lock). Never should have been replicated; always safe to drop.
+#      .stignore prevents new ones; this cleans historical residue.
+#   2. JSONL    — Claude Code session logs and similar append-only line logs.
+#      Both peers' lines are valuable; safest action is to line-union merge
+#      into the canonical file and delete the sidecar.
+#   3. USER     — everything else. Two divergent versions of real content
+#      (settings.json, CLAUDE.md, prose .md). Manual review only by default.
 #
-# Default: dry-run (lists what would be deleted). Pass --apply to actually
-# remove. Pass --keep <kind> to preserve specific kinds.
+# Default: dry-run (lists what would happen). Use --apply to act.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,41 +19,37 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_common.sh"
 
 APPLY=false
-KEEP_USER_CONTENT=true   # always default: don't auto-delete user-content conflicts
+MERGE_JSONL=false
+DELETE_USER=false
 
 usage() {
   cat <<EOF
-dotsync clean-conflicts — remove Syncthing's .sync-conflict-* files.
+dotsync clean-conflicts — handle Syncthing .sync-conflict-* files.
 
-Usage: dotsync clean-conflicts [--apply] [--all]
+Usage: dotsync clean-conflicts [--apply] [--merge] [--all]
 
 Options:
-  --apply   Actually delete the files. Without this, lists what would
-            go (dry run).
-  --all     Also remove conflicts on user content (settings.json,
-            CLAUDE.md, sessions, etc.). By default, only conflicts on
-            dotsync-internal state files (.last-sync, .sync-paused) are
-            removed — those are nonsense conflicts (per-machine state
-            that should never have been replicated).
+  --apply   Actually act. Without this, dry-run.
+  --merge   For *.jsonl conflicts, line-union merge into canonical and drop
+            the sidecar. Safe for append-only logs (Claude Code sessions).
+  --all     Also delete user-content conflicts that aren't .jsonl. THIS LOSES
+            ONE PEER'S VERSION. Only use after you've decided which side wins.
 
-What it does:
-  Scans \$DOTSYNC_DATA_DIR for *.sync-conflict-* files. Categorizes
-  each as either:
-    - INTERNAL — dotsync state file (always safe to delete)
-    - USER     — real user content; deletion loses one peer's version,
-                 only delete with --all and only after deciding which
-                 side to keep
+Categories:
+  internal  Per-machine dotsync state files — always safe to delete.
+  jsonl     Append-only logs — line-union merge with --merge.
+  user      Other user content — manual review unless --all.
 
-Recommended workflow for user-content conflicts: review them in
-\$DOTSYNC_DATA_DIR, decide which version to keep (sometimes the
-sync-conflict file IS what you want; rename it back over the original).
+Recommended quick fix when conflicts pile up:
+    dotsync clean-conflicts --apply --merge
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --apply)   APPLY=true; shift ;;
-    --all)     KEEP_USER_CONTENT=false; shift ;;
+    --merge)   MERGE_JSONL=true; shift ;;
+    --all)     DELETE_USER=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *)         die "unknown flag: $1" ;;
   esac
@@ -57,10 +57,8 @@ done
 
 [[ -d "$DOTSYNC_DATA_DIR" ]] || die "no data dir at $DOTSYNC_DATA_DIR"
 
-# Match file basenames that came from per-machine state files.
 is_internal() {
-  local name="$1"
-  case "$name" in
+  case "$1" in
     *.sync-conflict-*-*.last-sync)    return 0 ;;
     *.sync-conflict-*-*.sync-paused)  return 0 ;;
     *.sync-conflict-*-*.sync.lock*)   return 0 ;;
@@ -68,52 +66,181 @@ is_internal() {
   esac
 }
 
-internal_count=0
-user_count=0
+# Recover canonical filename from a sidecar:
+#   "abc.sync-conflict-20260501-203217-XA7N5BU.jsonl"  →  "abc.jsonl"
+#   "settings.sync-conflict-20260501-203217-XA7N5BU.json" → "settings.json"
+canonical_for() {
+  local name="$1"
+  # Strip .sync-conflict-DATE-TIME-DEVICE7 (with optional trailing extension).
+  python3 - "$name" <<'PY'
+import re, sys
+name = sys.argv[1]
+m = re.match(r"^(?P<stem>.+)\.sync-conflict-\d{8}-\d{6}-[A-Z0-9]{7}(?P<ext>\.[^./]+)?$", name)
+print((m.group("stem") + (m.group("ext") or "")) if m else name)
+PY
+}
+
+merge_jsonl_files() {
+  # Args: <canonical-path> <sidecar-path>
+  # Line-union: dedupe by content, sort by JSON `timestamp`. Entries
+  # without a timestamp inherit the most recent one in their source file,
+  # so headers / summary lines stay anchored to surrounding context. Tie-
+  # break by original insertion index. If neither file has any timestamps
+  # at all, this degrades to plain insertion order (canonical first).
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+canonical, sidecar = sys.argv[1], sys.argv[2]
+seen, entries = set(), []
+idx = 0
+for src in (canonical, sidecar):
+    last_ts = ""
+    try:
+        with open(src) as f:
+            for raw in f:
+                line = raw.rstrip("\n")
+                if not line or line in seen:
+                    continue
+                seen.add(line)
+                ts = None
+                try:
+                    obj = json.loads(line)
+                    ts = obj.get("timestamp")
+                except Exception:
+                    pass
+                if ts is not None:
+                    last_ts = ts
+                entries.append((last_ts, idx, line))
+                idx += 1
+    except FileNotFoundError:
+        pass
+entries.sort(key=lambda e: (e[0], e[1]))
+with open(canonical, "w") as f:
+    for _, _, line in entries:
+        f.write(line + "\n")
+PY
+}
+
 internal_files=()
+jsonl_files=()
 user_files=()
 
 while IFS= read -r f; do
   [[ -z "$f" ]] && continue
-  if is_internal "$(basename "$f")"; then
+  base="$(basename "$f")"
+  if is_internal "$base"; then
     internal_files+=("$f")
-    internal_count=$((internal_count + 1))
   else
-    user_files+=("$f")
-    user_count=$((user_count + 1))
+    canonical="$(canonical_for "$base")"
+    case "$canonical" in
+      *.jsonl) jsonl_files+=("$f") ;;
+      *)       user_files+=("$f") ;;
+    esac
   fi
 done < <(find "$DOTSYNC_DATA_DIR" -name '*.sync-conflict-*' -type f 2>/dev/null)
 
-echo "Found:"
-echo "  $internal_count internal (per-machine state — safe to delete)"
-echo "  $user_count user content"
+internal_count=${#internal_files[@]}
+jsonl_count=${#jsonl_files[@]}
+user_count=${#user_files[@]}
+total=$((internal_count + jsonl_count + user_count))
 
-if $APPLY; then
-  for f in "${internal_files[@]+"${internal_files[@]}"}"; do
-    rm -f "$f" && echo "  removed (internal): $f"
-  done
-  if ! $KEEP_USER_CONTENT; then
-    for f in "${user_files[@]+"${user_files[@]}"}"; do
-      rm -f "$f" && echo "  removed (USER): $f"
-    done
-  elif [[ $user_count -gt 0 ]]; then
-    echo
-    echo "Skipped $user_count user-content conflict(s). Inspect and resolve manually:"
-    for f in "${user_files[@]+"${user_files[@]}"}"; do echo "  $f"; done
-    echo
-    echo "Once you've decided what to keep on each, re-run with --all to drop the leftovers."
-  fi
-else
+echo "Found $total conflict file(s):"
+echo "  $internal_count internal (per-machine state)"
+echo "  $jsonl_count jsonl (line-union mergeable)"
+echo "  $user_count user content (other)"
+
+if [[ $total -eq 0 ]]; then
+  exit 0
+fi
+
+if ! $APPLY; then
   echo
-  echo "(dry run — pass --apply to actually delete)"
+  echo "(dry run — pass --apply to act)"
   if [[ $internal_count -gt 0 ]]; then
     echo
-    echo "Internal:"
-    for f in "${internal_files[@]+"${internal_files[@]}"}"; do echo "  $f"; done
+    echo "Internal (will be deleted with --apply):"
+    for f in "${internal_files[@]}"; do echo "  $f"; done
+  fi
+  if [[ $jsonl_count -gt 0 ]]; then
+    echo
+    if $MERGE_JSONL; then
+      echo "JSONL (will be merged + sidecar deleted with --apply):"
+    else
+      echo "JSONL (use --merge to line-union merge into canonical):"
+    fi
+    for f in "${jsonl_files[@]}"; do echo "  $f"; done
   fi
   if [[ $user_count -gt 0 ]]; then
     echo
-    echo "User content (use --all to also remove these):"
-    for f in "${user_files[@]+"${user_files[@]}"}"; do echo "  $f"; done
+    if $DELETE_USER; then
+      echo "User content (will be DELETED with --apply --all — DATA LOSS):"
+    else
+      echo "User content (manual review — open and decide which side to keep):"
+    fi
+    for f in "${user_files[@]}"; do echo "  $f"; done
+  fi
+  echo
+  echo "Quick fix: dotsync clean-conflicts --apply --merge"
+  exit 0
+fi
+
+# --apply path
+removed_internal=0
+merged_jsonl=0
+removed_user=0
+skipped_user=0
+
+for f in "${internal_files[@]+"${internal_files[@]}"}"; do
+  rm -f "$f" && removed_internal=$((removed_internal + 1))
+done
+
+if $MERGE_JSONL; then
+  for f in "${jsonl_files[@]+"${jsonl_files[@]}"}"; do
+    base="$(basename "$f")"
+    canonical_name="$(canonical_for "$base")"
+    canonical="$(dirname "$f")/$canonical_name"
+    if merge_jsonl_files "$canonical" "$f"; then
+      rm -f "$f"
+      merged_jsonl=$((merged_jsonl + 1))
+      log_info "merged jsonl conflict: $f → $canonical"
+    else
+      log_warn "merge failed; left in place: $f"
+    fi
+  done
+else
+  if [[ $jsonl_count -gt 0 ]]; then
+    echo
+    echo "Skipped $jsonl_count jsonl conflict(s). Re-run with --merge to merge."
   fi
 fi
+
+if $DELETE_USER; then
+  for f in "${user_files[@]+"${user_files[@]}"}"; do
+    rm -f "$f" && removed_user=$((removed_user + 1))
+  done
+elif [[ $user_count -gt 0 ]]; then
+  skipped_user=$user_count
+fi
+
+# Compact one-line summary so callers (UI POST handler) can surface it.
+parts=()
+[[ $removed_internal -gt 0 ]] && parts+=("removed $removed_internal internal")
+[[ $merged_jsonl -gt 0 ]]     && parts+=("merged $merged_jsonl jsonl")
+[[ $removed_user -gt 0 ]]     && parts+=("removed $removed_user user")
+[[ $skipped_user -gt 0 ]]     && parts+=("$skipped_user user need manual review")
+[[ ${#parts[@]} -eq 0 ]]      && parts+=("no changes")
+
+if [[ $skipped_user -gt 0 ]]; then
+  echo
+  echo "Manual review needed for:"
+  for f in "${user_files[@]+"${user_files[@]}"}"; do echo "  $f"; done
+  echo "Inspect each, decide which side to keep, then re-run with --all to drop the leftovers."
+  echo
+fi
+
+# Final line — kept last so callers parsing tail see the result.
+summary=""
+for p in "${parts[@]}"; do
+  [[ -n "$summary" ]] && summary+=", "
+  summary+="$p"
+done
+echo "Cleaned: $summary"

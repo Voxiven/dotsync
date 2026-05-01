@@ -29,9 +29,10 @@ last_sync=""
 paused="false"
 is_paused && paused="true"
 
+# Syncthing-era conflicts: *.sync-conflict-* sidecar files in the data dir.
 conflicts=0
-if [[ -d "$ENV_CONFLICTS_DIR" ]]; then
-  conflicts=$(find "$ENV_CONFLICTS_DIR" -mindepth 1 -maxdepth 1 -type d -not -name '_resolved' 2>/dev/null | wc -l | tr -d ' ')
+if [[ -d "$DOTSYNC_DATA_DIR" ]]; then
+  conflicts=$(find "$DOTSYNC_DATA_DIR" -name '*.sync-conflict-*' -type f 2>/dev/null | wc -l | tr -d ' ')
 fi
 
 daemon_state="unknown"
@@ -45,19 +46,14 @@ if command -v launchctl >/dev/null 2>&1; then
   fi
 fi
 
-repo_branch="?"
-if [[ -d "$DOTSYNC_DATA_DIR/.git" ]]; then
-  repo_branch="$(git -C "$DOTSYNC_DATA_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
-fi
-
 # Exit code: 0 = healthy, 1 = paused, 2 = conflicts, 3 = both.
 exit_code=0
 [[ "$paused" == "true" ]] && exit_code=$((exit_code | 1))
 [[ "$conflicts" -gt 0 ]] && exit_code=$((exit_code | 2))
 
 if $json; then
-  printf '{"service":"%s","data_dir":"%s","branch":"%s","last_sync":"%s","paused":%s,"conflicts":%d,"daemon":"%s"}\n' \
-    "$DOTSYNC_KC_SERVICE" "$DOTSYNC_DATA_DIR" "$repo_branch" "$last_sync" "$paused" "$conflicts" "$daemon_state"
+  printf '{"service":"%s","data_dir":"%s","last_sync":"%s","paused":%s,"conflicts":%d,"daemon":"%s"}\n' \
+    "$DOTSYNC_KC_SERVICE" "$DOTSYNC_DATA_DIR" "$last_sync" "$paused" "$conflicts" "$daemon_state"
   exit $exit_code
 fi
 
@@ -83,9 +79,9 @@ printf '\n'
 
 # Hints when something needs attention.
 if [[ "$paused" == "true" ]]; then
-  echo "  hint: run 'dotsync resolve' to handle conflicts and resume"
+  echo "  hint: run 'dotsync resume' to re-enable the sync daemon"
 elif [[ "$conflicts" -gt 0 ]]; then
-  echo "  hint: $conflicts unresolved conflict(s) at $ENV_CONFLICTS_DIR — run 'dotsync resolve'"
+  echo "  hint: $conflicts conflict(s) — run 'dotsync clean-conflicts --apply --merge'"
 fi
 
 exit $exit_code
