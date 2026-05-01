@@ -42,13 +42,24 @@ Other tools (Cursor, Aider, etc.) ship as experimental [profiles](#profiles) and
 
 ## Quickstart (5 min)
 
+### Install
+
+```bash
+# Once the tap is published:
+brew tap voxiven/tap
+brew install dotsync
+```
+
+Until the tap lands, you can clone + symlink:
+
+```bash
+git clone https://github.com/Voxiven/dotsync.git ~/.dotsync-tool
+ln -sf ~/.dotsync-tool/bin/dotsync /usr/local/bin/dotsync
+```
+
 ### Mac A — first machine
 
 ```bash
-# Install dotsync. (Homebrew tap coming soon — for now, clone + symlink.)
-git clone https://github.com/Voxiven/dotsync.git ~/.dotsync-tool
-ln -sf ~/.dotsync-tool/bin/dotsync /usr/local/bin/dotsync
-
 # One-command setup. Installs Syncthing, configures the folder, picks
 # default profiles (claude-code + project-secrets), prints your device ID.
 dotsync init
@@ -61,9 +72,7 @@ dotsync pair
 ### Mac B — second machine
 
 ```bash
-# Same install on the second machine.
-git clone https://github.com/Voxiven/dotsync.git ~/.dotsync-tool
-ln -sf ~/.dotsync-tool/bin/dotsync /usr/local/bin/dotsync
+# Same install (brew tap voxiven/tap && brew install dotsync, or clone).
 
 # Join with the code from Mac A.
 dotsync join --code 4-foo-bar-baz

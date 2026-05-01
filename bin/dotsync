@@ -3,9 +3,22 @@
 # Pattern: like git, hg, kubectl. `dotsync foo` execs `dotsync-foo`.
 set -uo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve symlinks so SCRIPT_DIR points to the real install location,
+# not the wrapper symlink Homebrew creates at /opt/homebrew/bin/dotsync.
+# (macOS lacks GNU readlink -f, so do it the portable way.)
+_resolve() {
+  local f="$1"
+  while [[ -L "$f" ]]; do
+    local d
+    d="$(cd "$(dirname "$f")" && pwd)"
+    f="$(readlink "$f")"
+    [[ "$f" != /* ]] && f="$d/$f"
+  done
+  cd "$(dirname "$f")" && pwd
+}
+SCRIPT_DIR="$(_resolve "${BASH_SOURCE[0]}")"
 
-VERSION="0.4.0-dev"
+VERSION="0.4.0"
 
 usage() {
   cat <<EOF
