@@ -46,11 +46,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Basic device-ID format check — 7 groups of 7 chars, dash-separated.
-if ! [[ "$DEVICE_ID" =~ ^[A-Z0-9]{7}(-[A-Z0-9]{7}){6}$ ]]; then
+# Basic device-ID format check — Syncthing device IDs are 8 groups of
+# 7 base32 chars, dash-separated (56 chars + 7 dashes = 63 total).
+if ! [[ "$DEVICE_ID" =~ ^[A-Z0-9]{7}(-[A-Z0-9]{7}){7}$ ]]; then
   die "device ID format looks wrong: $DEVICE_ID
-expected: 7 groups of 7 characters separated by dashes
-   e.g.: AAAAAAA-BBBBBBB-CCCCCCC-DDDDDDD-EEEEEEE-FFFFFFF-GGGGGGG"
+expected: 8 groups of 7 characters separated by dashes
+   e.g.: AAAAAAA-BBBBBBB-CCCCCCC-DDDDDDD-EEEEEEE-FFFFFFF-GGGGGGG-HHHHHHH"
 fi
 
 [[ -n "$NAME" ]] || NAME="${DEVICE_ID:0:7}"
