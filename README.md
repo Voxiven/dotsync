@@ -252,6 +252,7 @@ Multiple parallel setups (work + personal) are supported by overriding `DOTSYNC_
 - Cross-network pairing (magic-wormhole) and sync (Syncthing global discovery + relays)
 - Token-protected web dashboard at `localhost:7878`, optional public URL via `ui --share`
 - JSONL line-union merge for session conflicts (`clean-conflicts --merge`)
+- Auto-merge of session-jsonl conflicts every sync cycle (no manual cleanup)
 - `dotsync doctor` — 25-check setup + connectivity diagnostic
 - Homebrew tap (`brew tap voxiven/tap && brew install dotsync`)
 - 38 bats-core tests

@@ -24,7 +24,7 @@ import urllib.parse
 import webbrowser
 from pathlib import Path
 
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 
 # Token for non-loopback access. Empty = auth disabled (loopback-only mode).
 # Populated by main() on startup; checked by Handler.

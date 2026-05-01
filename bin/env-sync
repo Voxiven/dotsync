@@ -39,6 +39,23 @@ deploy_secrets() {
   done < <(secrets_pairs)
 }
 
+# Auto-merge any *.sync-conflict-* sidecars Syncthing has produced.
+# Runs every cycle so conflicts never pile up — for JSONL files (Claude
+# Code session logs), line-union merge is safe and lossless: both peers'
+# entries end up in the canonical file. Non-JSONL conflicts are left
+# alone (need human review). Quiet when there's nothing to do.
+auto_merge_conflicts() {
+  local first_sidecar
+  first_sidecar=$(find "$ENV_REPO_ROOT" -name '*.sync-conflict-*' -type f 2>/dev/null | head -1)
+  [[ -z "$first_sidecar" ]] && return 0
+  log_info "auto-merging sync-conflict files"
+  "$SCRIPT_DIR/dotsync-clean-conflicts" --apply --merge 2>&1 \
+    | grep -E '^(Cleaned|Manual review|  )' \
+    | while IFS= read -r line; do
+        log_info "  $line"
+      done || true
+}
+
 # Prune session storage in the repo: drop oversize files, drop subagents/
 # subtrees (per-machine state we don't sync), drop skipped projects.
 # Idempotent.
@@ -104,6 +121,12 @@ deploy_secrets
 if profile_mode_active; then
   profile_run_all deploy
 fi
+
+# 5. Auto-merge conflicts AFTER deploy: by now Syncthing has dropped any
+#    sidecars it's going to drop this cycle, so we can sweep them in one
+#    pass. Removing a sidecar + writing the merged canonical also nudges
+#    Syncthing to replicate that to peers, propagating the merge.
+auto_merge_conflicts
 
 date -u +%Y-%m-%dT%H:%M:%SZ > "$ENV_LASTSYNC_FILE"
 log_info "sync complete"
