@@ -1,0 +1,554 @@
+#!/usr/bin/env python3
+"""
+dotsync-ui — local status dashboard at http://127.0.0.1:7878
+
+Reads existing state files (no new state introduced):
+  - $DOTSYNC_DATA_DIR/.last-sync
+  - $DOTSYNC_DATA_DIR/.sync-paused
+  - $HOME/.dotsync-conflicts/<ts>/
+  - $HOME/Library/Logs/dotsync.log
+  - $DOTSYNC_DATA_DIR/registry/*.json
+  - profiles/*.json from the tool dir
+  - git log on the data repo for peer activity
+
+POST endpoints invoke other dotsync subcommands via subprocess:
+  - /api/sync   → dotsync sync
+  - /api/pause  → dotsync pause   (TODO once implemented)
+  - /api/resume → dotsync resume  (TODO once implemented)
+"""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import http.server
+import json
+import os
+import re
+import shlex
+import socketserver
+import subprocess
+import sys
+import urllib.parse
+import webbrowser
+from pathlib import Path
+
+# ── Configuration loading ─────────────────────────────────────────────
+
+
+def load_config() -> dict:
+    """Source ~/.config/dotsync/config.sh and capture variables."""
+    cfg = {
+        "DOTSYNC_DATA_DIR": os.environ.get(
+            "DOTSYNC_DATA_DIR", str(Path.home() / ".dotsync-data")
+        ),
+        "DOTSYNC_DATA_BRANCH": os.environ.get("DOTSYNC_DATA_BRANCH", "main"),
+        "DOTSYNC_KC_SERVICE": os.environ.get(
+            "DOTSYNC_KC_SERVICE", "dev.dotsync.envsync"
+        ),
+        "DOTSYNC_PROJECT_ROOT": os.environ.get(
+            "DOTSYNC_PROJECT_ROOT", str(Path.home())
+        ),
+    }
+    cfg_file = Path.home() / ".config" / "dotsync" / "config.sh"
+    if cfg_file.exists():
+        for line in cfg_file.read_text().splitlines():
+            m = re.match(r'^([A-Z_][A-Z0-9_]*)="?([^"]*)"?$', line.strip())
+            if m:
+                cfg[m.group(1)] = m.group(2)
+    return cfg
+
+
+def tool_dir() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+# ── Status gathering ──────────────────────────────────────────────────
+
+
+def gather_status(cfg: dict) -> dict:
+    data_dir = Path(cfg["DOTSYNC_DATA_DIR"])
+    home = Path.home()
+
+    # Last sync timestamp.
+    last_sync = ""
+    last_sync_file = data_dir / ".last-sync"
+    if last_sync_file.exists():
+        last_sync = last_sync_file.read_text().strip()
+
+    # Paused flag.
+    paused = (data_dir / ".sync-paused").exists()
+
+    # Conflicts.
+    conflicts_dir = home / ".dotsync-conflicts"
+    conflicts: list[dict] = []
+    if conflicts_dir.exists():
+        for p in sorted(conflicts_dir.iterdir()):
+            if p.is_dir() and p.name != "_resolved":
+                files = sorted(f.name for f in p.iterdir() if f.is_file())
+                conflicts.append({"id": p.name, "files": files})
+
+    # Daemon state (launchctl).
+    daemon = "unknown"
+    try:
+        out = subprocess.run(
+            ["launchctl", "list"], capture_output=True, text=True, timeout=2
+        ).stdout
+        daemon = "loaded" if cfg["DOTSYNC_KC_SERVICE"] in out else "not-loaded"
+    except Exception:
+        pass
+
+    # Git branch.
+    branch = "?"
+    if (data_dir / ".git").exists():
+        try:
+            branch = subprocess.run(
+                ["git", "-C", str(data_dir), "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True, text=True, timeout=2,
+            ).stdout.strip()
+        except Exception:
+            pass
+
+    # Peers (last commit per author/hostname over last 50 commits).
+    peers: dict[str, str] = {}
+    if (data_dir / ".git").exists():
+        try:
+            log = subprocess.run(
+                ["git", "-C", str(data_dir), "log", "-50", "--format=%an|%ai|%s"],
+                capture_output=True, text=True, timeout=3,
+            ).stdout
+            for line in log.splitlines():
+                parts = line.split("|", 2)
+                if len(parts) < 3:
+                    continue
+                author, when, subject = parts
+                # Pull hostname out of "auto-sync <host> <iso-ts>" subjects.
+                m = re.match(r"^auto-sync\s+(\S+)\s+", subject)
+                key = m.group(1) if m else author
+                if key not in peers:
+                    peers[key] = when
+        except Exception:
+            pass
+
+    # Profiles.
+    profiles: list[dict] = []
+    enabled = set()
+    enabled_file = data_dir / "registry" / "enabled-profiles.json"
+    if enabled_file.exists():
+        try:
+            enabled = set(json.loads(enabled_file.read_text()).get("profiles", []))
+        except Exception:
+            pass
+    profiles_dir = tool_dir() / "profiles"
+    if profiles_dir.exists():
+        for p in sorted(profiles_dir.glob("*.json")):
+            try:
+                d = json.loads(p.read_text())
+                profiles.append({
+                    "name": d.get("name", p.stem),
+                    "description": d.get("description", ""),
+                    "experimental": d.get("experimental", False),
+                    "enabled": d.get("name") in enabled,
+                    "paths": len(d.get("paths", [])),
+                })
+            except Exception:
+                pass
+
+    # Tracked secrets (legacy registry).
+    secrets: list[dict] = []
+    secrets_file = data_dir / "registry" / "secrets.json"
+    if secrets_file.exists():
+        try:
+            secrets = json.loads(secrets_file.read_text()).get("secrets", [])
+        except Exception:
+            pass
+
+    # Project list.
+    projects: list[str] = []
+    projects_file = data_dir / "registry" / "projects.json"
+    if projects_file.exists():
+        try:
+            d = json.loads(projects_file.read_text())
+            projects = [p.get("name", "?") for p in d.get("projects", [])]
+        except Exception:
+            pass
+
+    # Recent log lines.
+    log_file = home / "Library" / "Logs" / "dotsync.log"
+    log_tail: list[str] = []
+    if log_file.exists():
+        try:
+            with log_file.open() as f:
+                log_tail = f.readlines()[-30:]
+        except Exception:
+            pass
+
+    return {
+        "service": cfg["DOTSYNC_KC_SERVICE"],
+        "data_dir": str(data_dir),
+        "branch": branch,
+        "last_sync": last_sync,
+        "paused": paused,
+        "conflicts": conflicts,
+        "daemon": daemon,
+        "peers": peers,
+        "profiles": profiles,
+        "secrets": secrets,
+        "projects": projects,
+        "log_tail": [l.rstrip() for l in log_tail],
+        "now": dt.datetime.utcnow().isoformat() + "Z",
+    }
+
+
+# ── HTML rendering ────────────────────────────────────────────────────
+
+
+HTML_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="10">
+<title>dotsync — {service}</title>
+<style>
+  :root {{
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --good: #3fb950;
+    --warn: #d29922;
+    --bad:  #f85149;
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; padding: 24px;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro", system-ui, sans-serif;
+    background: var(--bg); color: var(--text);
+    font-size: 14px; line-height: 1.5;
+  }}
+  h1, h2 {{ margin: 0 0 12px; font-weight: 600; }}
+  h1 {{ font-size: 22px; }}
+  h2 {{ font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.05em; margin-top: 24px; }}
+  a {{ color: var(--accent); text-decoration: none; }}
+  .header {{ display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }}
+  .badge {{
+    display: inline-block; padding: 2px 8px; border-radius: 12px;
+    font-size: 11px; font-weight: 600; text-transform: uppercase;
+  }}
+  .badge.good {{ background: rgba(63, 185, 80, 0.15); color: var(--good); }}
+  .badge.warn {{ background: rgba(210, 153, 34, 0.15); color: var(--warn); }}
+  .badge.bad  {{ background: rgba(248, 81, 73, 0.15); color: var(--bad); }}
+  .meta {{ color: var(--muted); font-size: 13px; margin-bottom: 24px; }}
+  .panel {{
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 16px; margin-bottom: 16px;
+  }}
+  table {{ width: 100%; border-collapse: collapse; }}
+  th, td {{ text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }}
+  th {{ font-weight: 500; color: var(--muted); font-size: 12px; }}
+  tr:last-child td {{ border-bottom: none; }}
+  pre {{ margin: 0; font-family: "SF Mono", Menlo, Consolas, monospace;
+         font-size: 12px; color: var(--muted); white-space: pre-wrap;
+         max-height: 280px; overflow-y: auto; }}
+  .pill {{
+    display: inline-block; padding: 1px 6px; border-radius: 3px;
+    font-size: 11px; background: rgba(88, 166, 255, 0.1); color: var(--accent);
+  }}
+  button {{
+    font: inherit; padding: 6px 14px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--text); border-radius: 4px;
+    cursor: pointer; margin-right: 8px;
+  }}
+  button:hover {{ background: #21262d; border-color: var(--accent); }}
+  .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }}
+  @media (max-width: 800px) {{ .grid {{ grid-template-columns: 1fr; }} }}
+  .empty {{ color: var(--muted); font-style: italic; padding: 12px 0; }}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>dotsync</h1>
+  {status_badge}
+</div>
+<div class="meta">{service} · {data_dir} <span class="pill">{branch}</span></div>
+
+<div class="grid">
+  <div class="panel">
+    <h2>Sync state</h2>
+    <table>
+      <tr><th>Last sync</th><td>{last_sync_html}</td></tr>
+      <tr><th>Daemon</th><td>{daemon}</td></tr>
+      <tr><th>Conflicts</th><td>{conflict_count}</td></tr>
+      <tr><th>Now</th><td>{now}</td></tr>
+    </table>
+    <div style="margin-top: 12px;">
+      <form action="/api/sync" method="post" style="display:inline;">
+        <button type="submit">Sync now</button>
+      </form>
+      {pause_button}
+    </div>
+  </div>
+
+  <div class="panel">
+    <h2>Peers</h2>
+    {peers_html}
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Profiles</h2>
+  {profiles_html}
+</div>
+
+{conflicts_panel}
+
+<div class="grid">
+  <div class="panel">
+    <h2>Projects</h2>
+    {projects_html}
+  </div>
+  <div class="panel">
+    <h2>Tracked secrets</h2>
+    {secrets_html}
+  </div>
+</div>
+
+<div class="panel">
+  <h2>Recent log</h2>
+  <pre>{log_html}</pre>
+</div>
+
+<div class="meta" style="margin-top: 24px;">
+  Auto-refresh every 10s · dotsync v{version}
+</div>
+
+</body>
+</html>"""
+
+
+def html_escape(s: str) -> str:
+    return (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+    )
+
+
+def render_html(status: dict, version: str) -> str:
+    # Status badge
+    if status["paused"]:
+        badge = '<span class="badge bad">paused</span>'
+    elif status["conflicts"]:
+        badge = '<span class="badge warn">conflicts</span>'
+    elif status["daemon"] == "loaded":
+        badge = '<span class="badge good">healthy</span>'
+    else:
+        badge = '<span class="badge warn">no daemon</span>'
+
+    # Last sync — highlight if stale.
+    last_sync_html = html_escape(status["last_sync"]) or "<em>never</em>"
+    if status["last_sync"]:
+        try:
+            ts = dt.datetime.fromisoformat(status["last_sync"].replace("Z", "+00:00"))
+            age_s = (dt.datetime.now(dt.timezone.utc) - ts).total_seconds()
+            if age_s < 90:
+                last_sync_html += f' <span class="pill">{int(age_s)}s ago</span>'
+            elif age_s < 3600:
+                last_sync_html += f' <span class="pill">{int(age_s/60)}m ago</span>'
+            else:
+                last_sync_html += f' <span class="pill">{int(age_s/3600)}h ago</span>'
+        except Exception:
+            pass
+
+    # Pause/resume button
+    if status["paused"]:
+        pause_button = '<form action="/api/resume" method="post" style="display:inline;"><button type="submit">Resume</button></form>'
+    else:
+        pause_button = '<form action="/api/pause" method="post" style="display:inline;"><button type="submit">Pause</button></form>'
+
+    # Peers
+    if status["peers"]:
+        rows = "".join(
+            f"<tr><td>{html_escape(host)}</td><td>{html_escape(when)}</td></tr>"
+            for host, when in status["peers"].items()
+        )
+        peers_html = f"<table><tr><th>Machine</th><th>Last commit</th></tr>{rows}</table>"
+    else:
+        peers_html = '<div class="empty">No peers seen yet.</div>'
+
+    # Profiles
+    if status["profiles"]:
+        rows = []
+        for p in status["profiles"]:
+            mark = "✓" if p["enabled"] else "·"
+            tag = ' <span class="pill">experimental</span>' if p["experimental"] else ""
+            rows.append(
+                f"<tr><td>{mark}</td><td><b>{html_escape(p['name'])}</b>{tag}</td>"
+                f"<td>{html_escape(p['description'])}</td>"
+                f"<td>{p['paths']} paths</td></tr>"
+            )
+        profiles_html = (
+            "<table><tr><th></th><th>Profile</th><th>Description</th><th></th></tr>"
+            + "".join(rows) + "</table>"
+        )
+    else:
+        profiles_html = '<div class="empty">No profiles defined.</div>'
+
+    # Conflicts panel
+    if status["conflicts"]:
+        rows = []
+        for c in status["conflicts"]:
+            rows.append(
+                f"<tr><td>{html_escape(c['id'])}</td>"
+                f"<td>{html_escape(', '.join(c['files']))}</td></tr>"
+            )
+        conflicts_panel = (
+            '<div class="panel"><h2>Conflicts</h2>'
+            "<table><tr><th>ID</th><th>Files</th></tr>"
+            + "".join(rows)
+            + "</table>"
+            '<div style="margin-top:12px;color:var(--muted);">'
+            "Run <code>dotsync resolve</code> in a terminal to resolve."
+            "</div></div>"
+        )
+    else:
+        conflicts_panel = ""
+
+    # Projects
+    projects_html = (
+        "<ul>" + "".join(f"<li>{html_escape(p)}</li>" for p in status["projects"]) + "</ul>"
+        if status["projects"] else '<div class="empty">No projects registered.</div>'
+    )
+
+    # Secrets
+    secrets_html = (
+        "<ul>"
+        + "".join(
+            f"<li><code>{html_escape(s.get('repo_path', '?'))}</code> ← <code>{html_escape(s.get('real_path', '?'))}</code></li>"
+            for s in status["secrets"]
+        )
+        + "</ul>"
+        if status["secrets"]
+        else '<div class="empty">No secrets tracked. Use <code>dotsync track &lt;path&gt;</code>.</div>'
+    )
+
+    # Log
+    log_html = html_escape("\n".join(status["log_tail"])) or "<em>(no log entries yet)</em>"
+
+    return HTML_TEMPLATE.format(
+        service=html_escape(status["service"]),
+        data_dir=html_escape(status["data_dir"]),
+        branch=html_escape(status["branch"]),
+        status_badge=badge,
+        last_sync_html=last_sync_html,
+        daemon=html_escape(status["daemon"]),
+        conflict_count=len(status["conflicts"]),
+        now=html_escape(status["now"]),
+        pause_button=pause_button,
+        peers_html=peers_html,
+        profiles_html=profiles_html,
+        conflicts_panel=conflicts_panel,
+        projects_html=projects_html,
+        secrets_html=secrets_html,
+        log_html=log_html,
+        version=version,
+    )
+
+
+# ── HTTP handler ──────────────────────────────────────────────────────
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        # Quieter access log to stderr.
+        sys.stderr.write(f"[{self.log_date_time_string()}] {format % args}\n")
+
+    def _serve(self, code: int, body: bytes, content_type: str = "text/html; charset=utf-8"):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        cfg = load_config()
+        path = urllib.parse.urlparse(self.path).path
+        if path == "/api/status":
+            body = json.dumps(gather_status(cfg)).encode()
+            self._serve(200, body, "application/json")
+        elif path == "/" or path == "":
+            status = gather_status(cfg)
+            body = render_html(status, VERSION).encode()
+            self._serve(200, body)
+        else:
+            self._serve(404, b"not found", "text/plain")
+
+    def do_POST(self):
+        path = urllib.parse.urlparse(self.path).path
+        actions = {
+            "/api/sync":   ["env-sync"],
+            "/api/pause":  ["env-pause"],
+            "/api/resume": ["env-resolve"],
+        }
+        cmd = actions.get(path)
+        if not cmd:
+            self._serve(404, b"not found", "text/plain")
+            return
+        bin_path = tool_dir() / "bin" / cmd[0]
+        if not bin_path.exists():
+            self._serve(501, f"{cmd[0]} not implemented yet".encode(), "text/plain")
+            return
+        # Run async and redirect.
+        try:
+            subprocess.Popen([str(bin_path)] + cmd[1:],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception as e:
+            self._serve(500, str(e).encode(), "text/plain")
+            return
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.end_headers()
+
+
+# ── Entry ─────────────────────────────────────────────────────────────
+
+
+VERSION = "0.3.0-dev"
+
+
+def main():
+    parser = argparse.ArgumentParser(description="dotsync local status dashboard")
+    parser.add_argument("--port", type=int, default=7878)
+    parser.add_argument("--bind", default="127.0.0.1")
+    parser.add_argument("--no-open", action="store_true",
+                        help="Don't open the browser automatically")
+    parser.add_argument("--background", action="store_true",
+                        help="Run silently (for launchd)")
+    args = parser.parse_args()
+
+    url = f"http://{args.bind}:{args.port}/"
+    if not args.background:
+        print(f"Dashboard at {url}")
+        print("Reads existing state files; no new state written.")
+        print("Ctrl-C to stop.")
+
+    if not args.no_open and not args.background:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer((args.bind, args.port), Handler) as httpd:
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            if not args.background:
+                print("\nShutting down.")
+
+
+if __name__ == "__main__":
+    main()
