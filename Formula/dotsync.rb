@@ -22,8 +22,8 @@
 class Dotsync < Formula
   desc "Multi-machine continuity for Claude Code and other AI dev tools"
   homepage "https://github.com/Voxiven/dotsync"
-  url "https://github.com/Voxiven/dotsync/archive/refs/tags/v0.6.1.tar.gz"
-  sha256 "c0c46799e24646e9159eeec87e65a2be210b01e85622ee30fce63010c78a6286"
+  url "https://github.com/Voxiven/dotsync/archive/refs/tags/v0.6.2.tar.gz"
+  sha256 "3ea3e0a4dcfe475c007f9c8a753fb906417f42926951abba46583c206e43286e"
   license "MIT"
 
   depends_on "fswatch"
