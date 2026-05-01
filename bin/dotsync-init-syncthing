@@ -1,0 +1,322 @@
+#!/usr/bin/env bash
+# dotsync-init-syncthing — first-machine wizard for the Syncthing engine.
+#
+# Steps:
+#   1. Preflight (macOS, brew, install missing deps incl. syncthing)
+#   2. Start Syncthing daemon (auto-generates config + API key)
+#   3. Wait for daemon ready, cache the API key
+#   4. Create the data dir + add it as a Syncthing folder
+#   5. Profile selection + projects.json
+#   6. Write $DOTSYNC_CONFIG with DOTSYNC_ENGINE=syncthing
+#   7. Install our launchd agent (still useful: periodic capture/deploy)
+#   8. Print device ID for pairing
+#
+# No GitHub repo. No age key. No git-crypt. The age identity / git-crypt
+# stuff that v0.3 had is gone — Syncthing's TLS-in-transit + peer device
+# trust is the security model. (See docs/phase-4-syncthing.md, decision D1.)
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOL_DIR="$(dirname "$SCRIPT_DIR")"
+
+NON_INTERACTIVE=false
+FORCE=false
+PROJECT_ROOT_OVERRIDE=""
+
+usage() {
+  cat <<EOF
+dotsync init --engine syncthing — set up dotsync (Syncthing engine).
+
+Usage: dotsync init --engine syncthing [options]
+
+Options:
+  --project-root <path>  Where source-code projects live (auto-detected).
+  --non-interactive      Accept all defaults without prompting.
+  --force                Overwrite existing config.
+  -h, --help             Show this help.
+
+What it does:
+  1. Installs missing brew deps (syncthing, jq, fswatch, magic-wormhole).
+  2. Starts the Syncthing daemon (brew services start syncthing) and
+     waits for its REST API to come up at http://127.0.0.1:8384.
+  3. Creates ~/.dotsync-data/ and adds it as a Syncthing folder.
+  4. Asks which profiles to enable (default: claude-code + project-secrets).
+  5. Writes ~/.config/dotsync/config.sh with DOTSYNC_ENGINE=syncthing.
+  6. Installs our launchd agent for periodic capture/deploy
+     (separate from Syncthing's own daemon — ours runs the dotsync
+     CLI's capture/deploy cycle every 60s).
+  7. Prints your Syncthing device ID. You'll need it to pair with a
+     second machine via 'dotsync pair' / 'dotsync join'.
+
+After this, on a second machine: dotsync join --engine syncthing.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --project-root)    PROJECT_ROOT_OVERRIDE="$2"; shift 2 ;;
+    --non-interactive) NON_INTERACTIVE=true; shift ;;
+    --force)           FORCE=true; shift ;;
+    -h|--help)         usage; exit 0 ;;
+    *)                 echo "unknown flag: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+step() { printf '\n→ %s\n' "$*"; }
+say()  { printf '  %s\n' "$*"; }
+fail() { printf '✗ %s\n' "$*" >&2; exit 1; }
+ask()  {
+  $NON_INTERACTIVE && { printf '%s' "$2"; return; }
+  local prompt="$1" default="$2" reply
+  if [[ -n "$default" ]]; then
+    read -rp "$prompt [$default]: " reply
+    printf '%s' "${reply:-$default}"
+  else
+    read -rp "$prompt: " reply
+    printf '%s' "$reply"
+  fi
+}
+
+# ── 1. Preflight ────────────────────────────────────────────────────
+step "Preflight checks"
+
+[[ "$(uname -s)" == "Darwin" ]] || fail "macOS only"
+command -v git  >/dev/null || fail "git required"
+command -v brew >/dev/null || fail "Homebrew required (https://brew.sh/)"
+
+require_or_install() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    say "installing $1"
+    brew install "$1" >/dev/null || fail "brew install $1 failed"
+  fi
+}
+require_or_install jq
+require_or_install fswatch
+require_or_install magic-wormhole
+require_or_install syncthing
+
+# ── 2. Existing-config check ────────────────────────────────────────
+DOTSYNC_CONFIG="${DOTSYNC_CONFIG:-${HOME}/.config/dotsync/config.sh}"
+if [[ -f "$DOTSYNC_CONFIG" ]] && ! $FORCE; then
+  fail "dotsync already initialized at $DOTSYNC_CONFIG. Run 'dotsync uninstall' first if you want to start over."
+fi
+
+# ── 3. Start Syncthing daemon ───────────────────────────────────────
+step "Starting Syncthing daemon"
+
+ST_CFG_DIR="${HOME}/Library/Application Support/Syncthing"
+ST_API_BASE="http://127.0.0.1:8384"
+
+# brew services start runs syncthing as a launchd job (~/Library/
+# LaunchAgents/homebrew.mxcl.syncthing.plist). It auto-generates the
+# config + API key on first run.
+if ! brew services list 2>/dev/null | grep -q "^syncthing.*started"; then
+  brew services start syncthing >/dev/null 2>&1 \
+    || fail "brew services start syncthing failed"
+  say "started"
+else
+  say "already running"
+fi
+
+# Wait for the REST API to come up (config generation can take a few sec).
+say "waiting for REST API at $ST_API_BASE …"
+for i in {1..30}; do
+  curl -fsS --max-time 2 "$ST_API_BASE/rest/system/ping" >/dev/null 2>&1 && break
+  sleep 1
+done
+curl -fsS --max-time 2 "$ST_API_BASE/rest/system/ping" >/dev/null 2>&1 \
+  || fail "Syncthing daemon did not respond after 30s"
+say "ready"
+
+# Cache the API key (extracted from config.xml).
+ST_CFG_XML="${ST_CFG_DIR}/config.xml"
+[[ -f "$ST_CFG_XML" ]] || fail "$ST_CFG_XML not found"
+ST_API_KEY="$(grep -oE '<apikey>[^<]+</apikey>' "$ST_CFG_XML" | head -1 | sed -E 's|</?apikey>||g')"
+[[ -n "$ST_API_KEY" ]] || fail "could not extract API key from $ST_CFG_XML"
+
+ST_API_KEY_FILE="${HOME}/Library/Application Support/Syncthing/apikey"
+mkdir -p "$(dirname "$ST_API_KEY_FILE")"
+printf '%s' "$ST_API_KEY" > "$ST_API_KEY_FILE"
+chmod 600 "$ST_API_KEY_FILE"
+
+st_curl() {
+  local method="$1" path="$2" body="${3:-}"
+  if [[ -n "$body" ]]; then
+    curl -fsS --max-time 5 \
+      -H "X-API-Key: $ST_API_KEY" \
+      -H "Content-Type: application/json" \
+      -X "$method" -d "$body" \
+      "${ST_API_BASE}${path}"
+  else
+    curl -fsS --max-time 5 \
+      -H "X-API-Key: $ST_API_KEY" \
+      -X "$method" "${ST_API_BASE}${path}"
+  fi
+}
+
+# ── 4. Get our device ID + create the dotsync folder ────────────────
+step "Configuring Syncthing folder"
+
+MY_DEVICE_ID=$(st_curl GET /rest/system/status | jq -r '.myID')
+[[ -n "$MY_DEVICE_ID" && "$MY_DEVICE_ID" != "null" ]] || fail "could not retrieve device ID"
+say "this device: $MY_DEVICE_ID"
+
+DOTSYNC_DATA_DIR="${DOTSYNC_DATA_DIR:-${HOME}/.dotsync-data}"
+SYNCTHING_FOLDER_ID="${SYNCTHING_FOLDER_ID:-dotsync-data}"
+
+mkdir -p "$DOTSYNC_DATA_DIR"
+
+# Add (or update — Syncthing's PUT is upsert-ish) the folder. The folder
+# starts shared only with ourselves; peers get added later via dotsync pair.
+folder_payload=$(jq -n \
+  --arg id "$SYNCTHING_FOLDER_ID" \
+  --arg path "$DOTSYNC_DATA_DIR" \
+  --arg dev "$MY_DEVICE_ID" \
+  '{
+    id: $id,
+    label: "dotsync data",
+    path: $path,
+    type: "sendreceive",
+    devices: [{ deviceID: $dev }],
+    fsWatcherEnabled: true,
+    rescanIntervalS: 60
+  }')
+
+# Check whether the folder already exists in Syncthing's config.
+existing=$(st_curl GET "/rest/config/folders/$SYNCTHING_FOLDER_ID" 2>/dev/null || echo "")
+if [[ -n "$existing" && "$existing" != "null" ]]; then
+  say "folder $SYNCTHING_FOLDER_ID already configured in Syncthing — leaving as-is"
+else
+  st_curl POST /rest/config/folders "$folder_payload" >/dev/null \
+    || fail "failed to create Syncthing folder"
+  say "created folder $SYNCTHING_FOLDER_ID at $DOTSYNC_DATA_DIR"
+fi
+
+# ── 5. Profiles ─────────────────────────────────────────────────────
+step "Profile selection"
+
+PROFILES_DIR="$TOOL_DIR/profiles"
+default_profiles="claude-code project-secrets"
+
+if $NON_INTERACTIVE; then
+  enabled="$default_profiles"
+else
+  echo
+  echo "Available profiles:"
+  for p in "$PROFILES_DIR"/*.json; do
+    name=$(jq -r '.name' "$p")
+    desc=$(jq -r '.description' "$p")
+    exp=$(jq -r '.experimental // false' "$p")
+    tag=""; [[ "$exp" == "true" ]] && tag=" (experimental)"
+    printf '    %-20s %s%s\n' "$name" "$desc" "$tag"
+  done
+  echo
+  enabled="$(ask "Enable (space-separated, or 'all')" "$default_profiles")"
+  if [[ "$enabled" == "all" ]]; then
+    enabled="$(jq -r '.name' "$PROFILES_DIR"/*.json | tr '\n' ' ')"
+  fi
+fi
+
+mkdir -p "$DOTSYNC_DATA_DIR/registry"
+jq -n --arg list "$enabled" '{profiles: ($list | split(" ") | map(select(length > 0)))}' \
+  > "$DOTSYNC_DATA_DIR/registry/enabled-profiles.json"
+
+# ── 6. Project root + projects.json ─────────────────────────────────
+step "Project root"
+
+detect_project_root() {
+  for c in "$HOME/code" "$HOME/dev" "$HOME/Workspace" "$HOME/projects" "$HOME/LearnToCode/GamesProject"; do
+    [[ -d "$c" ]] || continue
+    n=$(find "$c" -mindepth 2 -maxdepth 2 -name '.git' -type d 2>/dev/null | wc -l | tr -d ' ')
+    [[ "$n" -gt 0 ]] && { printf '%s\t%d' "$c" "$n"; return; }
+  done
+}
+
+if [[ -n "$PROJECT_ROOT_OVERRIDE" ]]; then
+  PROJECT_ROOT="$PROJECT_ROOT_OVERRIDE"
+else
+  detected="$(detect_project_root)"
+  if [[ -n "$detected" ]]; then
+    detected_path="${detected%%$'\t'*}"
+    detected_count="${detected##*$'\t'}"
+    say "detected: $detected_path ($detected_count git repos)"
+    PROJECT_ROOT="$(ask "Project root for this machine" "$detected_path")"
+  else
+    PROJECT_ROOT="$(ask "Project root for this machine" "$HOME")"
+  fi
+fi
+
+if [[ ! -f "$DOTSYNC_DATA_DIR/registry/projects.json" ]]; then
+  say "scanning $PROJECT_ROOT for git repos…"
+  projects_json='{"version":2,"projects":[]}'
+  while IFS= read -r repo; do
+    name="$(basename "$(dirname "$repo")")"
+    projects_json=$(echo "$projects_json" | jq --arg n "$name" '.projects += [{"name":$n,"label":$n}]')
+  done < <(find "$PROJECT_ROOT" -mindepth 2 -maxdepth 2 -name '.git' -type d 2>/dev/null)
+  echo "$projects_json" | jq . > "$DOTSYNC_DATA_DIR/registry/projects.json"
+  count=$(jq -r '.projects | length' "$DOTSYNC_DATA_DIR/registry/projects.json")
+  say "registered $count project(s)"
+fi
+
+[[ -f "$DOTSYNC_DATA_DIR/registry/secrets.json" ]] || \
+  echo '{"secrets":[]}' > "$DOTSYNC_DATA_DIR/registry/secrets.json"
+
+# ── 7. Save dotsync config ──────────────────────────────────────────
+step "Writing config"
+
+KC_SERVICE="${DOTSYNC_KC_SERVICE:-dev.dotsync.envsync}"
+
+mkdir -p "$(dirname "$DOTSYNC_CONFIG")"
+cat > "$DOTSYNC_CONFIG" <<EOF
+# dotsync config — generated by dotsync init --engine syncthing on $(date -u +%Y-%m-%dT%H:%M:%SZ)
+DOTSYNC_ENGINE="syncthing"
+DOTSYNC_DATA_DIR="$DOTSYNC_DATA_DIR"
+DOTSYNC_KC_SERVICE="$KC_SERVICE"
+DOTSYNC_PROJECT_ROOT="$PROJECT_ROOT"
+DOTSYNC_SESSION_MAX_MB=50
+DOTSYNC_SKIP_PROJECTS=""
+SYNCTHING_FOLDER_ID="$SYNCTHING_FOLDER_ID"
+SYNCTHING_API_BASE="$ST_API_BASE"
+EOF
+say "wrote $DOTSYNC_CONFIG"
+
+# ── 8. Install our launchd agent ────────────────────────────────────
+# Syncthing has its own daemon; ours wraps capture/deploy on a 60s cycle.
+step "Installing dotsync launchd agent"
+LABEL="$KC_SERVICE"
+plist_dest="$HOME/Library/LaunchAgents/${LABEL}.plist"
+mkdir -p "$(dirname "$plist_dest")"
+sed -e "s|__LABEL__|$LABEL|g" \
+    -e "s|__TOOL_DIR__|$TOOL_DIR|g" \
+    -e "s|__DATA_DIR__|$DOTSYNC_DATA_DIR|g" \
+    -e "s|__HOME__|$HOME|g" \
+    -e "s|__CONFIG__|$DOTSYNC_CONFIG|g" \
+    "$TOOL_DIR/launchd/dev.dotsync.envsync.plist.template" > "$plist_dest"
+plutil -lint "$plist_dest" >/dev/null || fail "plist invalid"
+launchctl unload "$plist_dest" 2>/dev/null || true
+launchctl load -w "$plist_dest" || fail "launchctl load failed"
+say "loaded $plist_dest"
+
+# ── 9. Done ─────────────────────────────────────────────────────────
+cat <<EOF
+
+✅ dotsync ready (Syncthing engine).
+
+  Engine:           syncthing
+  Data dir:         $DOTSYNC_DATA_DIR
+  Folder ID:        $SYNCTHING_FOLDER_ID
+  This device:      $MY_DEVICE_ID
+  Profiles:         $enabled
+  Daemons running:
+    - syncthing (brew services) — peer-to-peer file replication
+    - $LABEL (launchd) — capture/deploy cycle every 60s
+
+To pair a second machine:
+
+  On THIS machine:    dotsync pair
+  On the other one:   dotsync join --engine syncthing
+
+The Syncthing web UI is available at $ST_API_BASE — useful for
+inspecting folder state and adding peers manually.
+
+EOF
