@@ -59,9 +59,14 @@ _st_curl() {
   fi
 }
 
-# Returns 0 if the Syncthing daemon is reachable.
+# Returns 0 if the Syncthing daemon is reachable. Accepts any 1xx-5xx
+# HTTP response — Syncthing v2+ returns 403 on /ping without an API key,
+# but 403 still means "the server is running" which is what this checks.
 st_running() {
-  curl -fsS --max-time 2 "${SYNCTHING_API_BASE}/rest/system/ping" >/dev/null 2>&1
+  local code
+  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 \
+    "${SYNCTHING_API_BASE}/rest/system/ping" 2>/dev/null || echo 000)
+  [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]
 }
 
 # Trigger a folder rescan. Idempotent; harmless if already scanning.
