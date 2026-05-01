@@ -343,6 +343,21 @@ else
   check PASS "sync state" "active"
 fi
 
+# Stale lock detection: a crashed env-sync leaves $ENV_LOCK_DIR behind
+# and every subsequent run exits as a no-op. 0.7.2+ env-sync auto-
+# reclaims dead-PID locks, but doctor surfaces the situation so the
+# user knows when sync has been silently dark.
+if [[ -d "$ENV_LOCK_DIR" ]]; then
+  lock_pid="$(cat "$ENV_LOCK_DIR/pid" 2>/dev/null || echo "")"
+  if [[ -n "$lock_pid" ]] && kill -0 "$lock_pid" 2>/dev/null; then
+    check PASS "sync lock" "held by live env-sync (pid $lock_pid)"
+  else
+    age_s=$(( $(date +%s) - $(stat -f '%m' "$ENV_LOCK_DIR" 2>/dev/null || echo 0) ))
+    check WARN "sync lock" "stale (no live holder, age ${age_s}s)" \
+      "next env-sync will auto-reclaim on 0.7.2+; meanwhile 'rm -rf $ENV_LOCK_DIR' to unblock immediately"
+  fi
+fi
+
 # Last sync recency.
 if [[ -f "$ENV_LASTSYNC_FILE" ]]; then
   last_sync_str="$(cat "$ENV_LASTSYNC_FILE" 2>/dev/null)"

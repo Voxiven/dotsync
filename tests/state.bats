@@ -75,6 +75,33 @@ _load_syncthing() {
   [[ "$mt1" == "$mt2" ]]
 }
 
+@test "env-sync: reclaims stale lock when holder PID is dead" {
+  source_internals
+  mkdir -p "$DOTSYNC_DATA_DIR"
+  # Stale lock with a guaranteed-dead PID.
+  mkdir "$DOTSYNC_STATE_DIR/sync.lock"
+  echo "9999999" > "$DOTSYNC_STATE_DIR/sync.lock/pid"
+
+  # Run env-sync. Without Syncthing in the sandbox it'll exit at the
+  # st_running check, but lock reclaim happens before that and the
+  # cleanup trap should remove the lock on exit.
+  run "$TOOL_DIR/bin/env-sync"
+  [[ ! -d "$DOTSYNC_STATE_DIR/sync.lock" ]]
+}
+
+@test "env-sync: respects live lock (no reclaim, exits cleanly)" {
+  source_internals
+  mkdir -p "$DOTSYNC_DATA_DIR"
+  # Lock with the test runner's own PID — definitely alive.
+  mkdir "$DOTSYNC_STATE_DIR/sync.lock"
+  echo "$$" > "$DOTSYNC_STATE_DIR/sync.lock/pid"
+
+  run "$TOOL_DIR/bin/env-sync"
+  # Lock still there with our PID (env-sync did not touch it).
+  [[ -d "$DOTSYNC_STATE_DIR/sync.lock" ]]
+  [[ "$(cat "$DOTSYNC_STATE_DIR/sync.lock/pid")" == "$$" ]]
+}
+
 @test "st_write_stignore: heals when content drifted" {
   _load_syncthing
   echo "bad content" > "$DOTSYNC_DATA_DIR/.stignore"

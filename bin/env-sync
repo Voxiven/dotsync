@@ -82,11 +82,32 @@ prune_sessions() {
 
 # Per-machine mutex (mkdir lock; flock isn't on default macOS).
 # $ENV_LOCK_DIR is in $DOTSYNC_STATE_DIR (per-machine), set in _common.sh.
+# We write our PID into $ENV_LOCK_DIR/pid on acquire so contending runs
+# can tell whether the lock is stale (holder dead = reclaim) or live
+# (holder alive = back off cleanly). Without this check, a crashed
+# env-sync leaves the dir behind and every subsequent run — including
+# the Force Sync UI button — silently exits as a no-op forever.
+_lock_holder_pid() {
+  cat "$ENV_LOCK_DIR/pid" 2>/dev/null
+}
+_lock_holder_alive() {
+  local pid; pid=$(_lock_holder_pid)
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
 if ! mkdir "$ENV_LOCK_DIR" 2>/dev/null; then
-  log_info "another env-sync is running; exiting cleanly"
-  exit 0
+  if _lock_holder_alive; then
+    log_info "another env-sync is running (pid $(_lock_holder_pid)); exiting cleanly"
+    exit 0
+  fi
+  log_warn "stale lock at $ENV_LOCK_DIR (holder pid $(_lock_holder_pid 2>/dev/null || echo unknown) is dead); reclaiming"
+  rm -rf "$ENV_LOCK_DIR"
+  if ! mkdir "$ENV_LOCK_DIR" 2>/dev/null; then
+    log_warn "could not reclaim lock; exiting"
+    exit 0
+  fi
 fi
-trap 'rmdir "$ENV_LOCK_DIR" 2>/dev/null' EXIT
+echo "$$" > "$ENV_LOCK_DIR/pid"
+trap 'rm -rf "$ENV_LOCK_DIR" 2>/dev/null' EXIT
 
 if is_paused; then
   log_warn "sync paused; run 'dotsync resume' to re-enable"
