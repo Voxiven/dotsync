@@ -17,6 +17,8 @@ Setup (run once per machine):
   init                Set up dotsync on the first machine
   join                Set up dotsync on a second machine (pair w/ first)
   pair                Generate a one-time pairing code (called from join)
+  restore             Re-attach using an existing Keychain identity
+  uninstall           Tear down a dotsync setup on this machine
 
 Daily use:
   status              One-line summary of sync state

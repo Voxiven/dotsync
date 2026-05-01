@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# dotsync-restore — re-attach this machine to an existing data repo using
+# an age identity that's already in the Keychain.
+#
+# Use cases:
+#   - Recovering after `dotsync uninstall` if you kept --keep-keychain
+#     (or simply never had it removed)
+#   - Restoring after a disk wipe where you've added the identity back
+#     to Keychain manually (e.g. pasted from 1Password)
+#   - Adding a third machine to an existing setup when you have the
+#     identity already (no wormhole pairing needed)
+#
+# This is the no-wormhole counterpart to `dotsync join`. Use `join` when
+# the identity needs to be transferred from another machine; use `restore`
+# when the identity is already on this machine.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOL_DIR="$(dirname "$SCRIPT_DIR")"
+
+REPO_URL=""
+BRANCH="main"
+PROJECT_ROOT_OVERRIDE=""
+NON_INTERACTIVE=false
+FORCE=false
+
+usage() {
+  cat <<EOF
+dotsync restore — wire up a dotsync setup using an existing Keychain identity.
+
+Usage: dotsync restore [options]
+
+Options:
+  --repo <url>           Data repo URL (required if config doesn't have one).
+  --branch <name>        Branch to track (default: main).
+  --project-root <path>  Where source-code projects live on this machine
+                         (auto-detected if not supplied).
+  --non-interactive      Skip prompts; --repo required.
+  --force                Overwrite existing config / data dir.
+  -h, --help             Show help.
+
+Behavior:
+  1. Verifies an age identity exists in Keychain at the configured service
+     (DOTSYNC_KC_SERVICE, default: dev.dotsync.envsync). If not, prints
+     instructions to add one and exits.
+  2. Writes \$DOTSYNC_CONFIG with the supplied repo / branch / paths.
+  3. Clones the data repo and unlocks it with the Keychain identity.
+  4. Installs the launchd agent and runs an initial sync.
+
+To target a specific Keychain service (e.g. when restoring production
+after a test uninstall): set DOTSYNC_KC_SERVICE inline:
+
+  DOTSYNC_KC_SERVICE=ai.omphalis.envsync dotsync restore --repo <url>
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --repo)            REPO_URL="$2"; shift 2 ;;
+    --branch)          BRANCH="$2"; shift 2 ;;
+    --project-root)    PROJECT_ROOT_OVERRIDE="$2"; shift 2 ;;
+    --non-interactive) NON_INTERACTIVE=true; shift ;;
+    --force)           FORCE=true; shift ;;
+    -h|--help)         usage; exit 0 ;;
+    *)                 echo "unknown flag: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+step() { printf '\n→ %s\n' "$*"; }
+say()  { printf '  %s\n' "$*"; }
+fail() { printf '✗ %s\n' "$*" >&2; exit 1; }
+ask()  {
+  $NON_INTERACTIVE && { printf '%s' "$2"; return; }
+  local prompt="$1" default="$2" reply
+  if [[ -n "$default" ]]; then
+    read -rp "$prompt [$default]: " reply
+    printf '%s' "${reply:-$default}"
+  else
+    read -rp "$prompt: " reply
+    printf '%s' "$reply"
+  fi
+}
+
+# ── Preflight ────────────────────────────────────────────────────────
+step "Preflight"
+[[ "$(uname -s)" == "Darwin" ]] || fail "macOS only"
+command -v git  >/dev/null || fail "git required"
+command -v brew >/dev/null || fail "Homebrew required (https://brew.sh/)"
+
+require_or_install() {
+  command -v "$1" >/dev/null 2>&1 && return
+  say "installing $1"
+  brew install "$1" >/dev/null || fail "brew install $1 failed"
+}
+require_or_install git-crypt
+require_or_install age
+require_or_install jq
+require_or_install fswatch
+
+# ── Existing-config check ───────────────────────────────────────────
+DOTSYNC_CONFIG="${DOTSYNC_CONFIG:-${HOME}/.config/dotsync/config.sh}"
+if [[ -f "$DOTSYNC_CONFIG" ]] && ! $FORCE; then
+  cat >&2 <<EOF
+✗ dotsync already configured at $DOTSYNC_CONFIG.
+
+If you want to point this machine at a different repo / setup:
+  dotsync uninstall --keep-keychain    # keep identity for restore
+  dotsync restore --repo <url>
+
+To run a SECOND dotsync instance alongside the existing one:
+  DOTSYNC_CONFIG=~/.config/dotsync/config-other.sh \\
+  DOTSYNC_DATA_DIR=~/.dotsync-data-other \\
+  DOTSYNC_KC_SERVICE=other.dotsync.envsync \\
+    dotsync restore --repo <url>
+EOF
+  exit 1
+fi
+
+# ── Verify Keychain identity exists ──────────────────────────────────
+step "Verifying identity"
+
+KC_SERVICE="${DOTSYNC_KC_SERVICE:-dev.dotsync.envsync}"
+KC_ACCOUNT="${DOTSYNC_KC_ACCOUNT:-default}"
+
+if ! security find-generic-password -s "$KC_SERVICE" -a "$KC_ACCOUNT" -w >/dev/null 2>&1; then
+  cat >&2 <<EOF
+✗ no age identity found in Keychain at:
+    service: $KC_SERVICE
+    account: $KC_ACCOUNT
+
+Options:
+  1. If you have a different service name (e.g. ai.omphalis.envsync),
+     set it inline:
+       DOTSYNC_KC_SERVICE=<name> dotsync restore --repo <url>
+
+  2. If you have the identity from a recovery file or 1Password, paste
+     it back into Keychain:
+       security add-generic-password -s '$KC_SERVICE' -a '$KC_ACCOUNT' -U -w
+     (it will prompt — paste the AGE-SECRET-KEY-1... line)
+
+  3. If you don't have the identity anywhere, you can't restore — the
+     repo data is encrypted. Run 'dotsync init' to start over with a
+     new identity (you'll lose access to the old encrypted data).
+
+  4. To pair from another machine that has the identity:
+       dotsync join --repo <url>
+     and on the other machine: dotsync pair
+EOF
+  exit 1
+fi
+say "found identity in Keychain ($KC_SERVICE / $KC_ACCOUNT)"
+
+# ── Repo URL ────────────────────────────────────────────────────────
+step "Data repo"
+[[ -n "$REPO_URL" ]] || REPO_URL="$(ask "Data repo URL" "")"
+[[ -n "$REPO_URL" ]] || fail "data repo URL required"
+
+DOTSYNC_DATA_DIR="${DOTSYNC_DATA_DIR:-${HOME}/.dotsync-data}"
+if [[ -d "$DOTSYNC_DATA_DIR/.git" ]] && ! $FORCE; then
+  fail "$DOTSYNC_DATA_DIR already exists. Run 'dotsync uninstall --keep-keychain' first, or rm -rf it."
+fi
+
+# ── Project root ────────────────────────────────────────────────────
+step "Project root"
+detect_project_root() {
+  for c in "$HOME/code" "$HOME/dev" "$HOME/Workspace" "$HOME/projects" "$HOME/LearnToCode/GamesProject"; do
+    [[ -d "$c" ]] || continue
+    n=$(find "$c" -mindepth 2 -maxdepth 2 -name '.git' -type d 2>/dev/null | wc -l | tr -d ' ')
+    [[ "$n" -gt 0 ]] && { printf '%s' "$c"; return; }
+  done
+}
+if [[ -n "$PROJECT_ROOT_OVERRIDE" ]]; then
+  PROJECT_ROOT="$PROJECT_ROOT_OVERRIDE"
+else
+  detected="$(detect_project_root)"
+  if [[ -n "$detected" ]]; then
+    say "detected: $detected"
+    PROJECT_ROOT="$(ask "Project root for this machine" "$detected")"
+  else
+    PROJECT_ROOT="$(ask "Project root for this machine" "$HOME")"
+  fi
+fi
+
+# ── Write config ────────────────────────────────────────────────────
+step "Writing config"
+mkdir -p "$(dirname "$DOTSYNC_CONFIG")"
+cat > "$DOTSYNC_CONFIG" <<EOF
+# dotsync config — generated by dotsync restore on $(date -u +%Y-%m-%dT%H:%M:%SZ)
+DOTSYNC_DATA_DIR="$DOTSYNC_DATA_DIR"
+DOTSYNC_DATA_REMOTE="$REPO_URL"
+DOTSYNC_DATA_BRANCH="$BRANCH"
+DOTSYNC_KC_SERVICE="$KC_SERVICE"
+DOTSYNC_KC_ACCOUNT="$KC_ACCOUNT"
+DOTSYNC_PROJECT_ROOT="$PROJECT_ROOT"
+DOTSYNC_SESSION_MAX_MB=50
+DOTSYNC_SKIP_PROJECTS=""
+EOF
+say "wrote $DOTSYNC_CONFIG"
+
+# ── Clone + unlock ──────────────────────────────────────────────────
+step "Cloning data repo"
+[[ -d "$DOTSYNC_DATA_DIR" ]] && rm -rf "$DOTSYNC_DATA_DIR"
+git clone -b "$BRANCH" "$REPO_URL" "$DOTSYNC_DATA_DIR" --quiet \
+  || fail "clone failed (does the branch exist? do you have access?)"
+
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_common.sh"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_crypt.sh"
+unlock_repo
+
+# ── Daemon ──────────────────────────────────────────────────────────
+step "Installing launchd agent"
+LABEL="$KC_SERVICE"
+plist_dest="$HOME/Library/LaunchAgents/${LABEL}.plist"
+mkdir -p "$(dirname "$plist_dest")"
+sed -e "s|__LABEL__|$LABEL|g" \
+    -e "s|__TOOL_DIR__|$TOOL_DIR|g" \
+    -e "s|__DATA_DIR__|$DOTSYNC_DATA_DIR|g" \
+    -e "s|__HOME__|$HOME|g" \
+    -e "s|__CONFIG__|$DOTSYNC_CONFIG|g" \
+    "$TOOL_DIR/launchd/dev.dotsync.envsync.plist.template" > "$plist_dest"
+plutil -lint "$plist_dest" >/dev/null || fail "plist invalid"
+launchctl unload "$plist_dest" 2>/dev/null || true
+launchctl load -w "$plist_dest" || fail "launchctl load failed"
+say "loaded $plist_dest"
+
+# ── First sync ──────────────────────────────────────────────────────
+step "Initial sync"
+if "$SCRIPT_DIR/env-sync"; then
+  say "initial sync OK"
+else
+  say "(initial sync had issues — run 'dotsync logs' to inspect)"
+fi
+
+cat <<EOF
+
+✅ dotsync restored.
+
+  Repo:    $REPO_URL ($BRANCH)
+  Service: $KC_SERVICE
+  Daemon:  running (every 60s)
+
+Run 'dotsync status' to confirm health.
+EOF
