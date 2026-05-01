@@ -24,7 +24,20 @@ import urllib.parse
 import webbrowser
 from pathlib import Path
 
-VERSION = "0.5.2"
+# Read VERSION from bin/dotsync (single source of truth) so a release
+# bump only needs to touch the dispatcher.
+def _read_version() -> str:
+    here = Path(__file__).resolve().parent
+    try:
+        for line in (here / "dotsync").read_text().splitlines():
+            if line.startswith("VERSION="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return "unknown"
+
+
+VERSION = _read_version()
 
 # Token for non-loopback access. Empty = auth disabled (loopback-only mode).
 # Populated by main() on startup; checked by Handler.

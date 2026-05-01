@@ -18,7 +18,7 @@ _resolve() {
 }
 SCRIPT_DIR="$(_resolve "${BASH_SOURCE[0]}")"
 
-VERSION="0.6.0"
+VERSION="0.6.1"
 
 usage() {
   cat <<EOF
