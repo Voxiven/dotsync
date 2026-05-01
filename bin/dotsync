@@ -19,6 +19,7 @@ Setup (run once per machine):
   pair                Generate a one-time pairing code (called from join)
   add-peer            Finish syncthing pairing — add a peer's device ID
   restore             Re-attach using an existing Keychain identity
+  upgrade             Migrate this machine from git engine → syncthing
   uninstall           Tear down a dotsync setup on this machine
 
 Daily use:

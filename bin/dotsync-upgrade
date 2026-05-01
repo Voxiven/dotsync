@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+# dotsync-upgrade — flip this machine from git engine to Syncthing engine.
+#
+# Per-machine, in-place: keeps the same $DOTSYNC_DATA_DIR (just stops being
+# a git repo and starts being a Syncthing-managed folder). The age identity
+# in Keychain becomes vestigial; uninstall after Phase 4.6 cleanup.
+#
+# After upgrading both machines, re-pair them via the existing flow:
+#   Mac A: dotsync pair
+#   Mac B: dotsync join --code <code>
+#   Mac A: dotsync add-peer <Mac-B-id>   (Mac B prints this)
+#
+# Until both machines are upgraded + re-paired, peer-to-peer sync is
+# offline. Plan to do them within the same session.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOL_DIR="$(dirname "$SCRIPT_DIR")"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_common.sh"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_crypt.sh"
+
+ROLLBACK=false
+FINALIZE=false
+FORCE=false
+
+usage() {
+  cat <<EOF
+dotsync upgrade — flip the local engine from git to syncthing.
+
+Usage: dotsync upgrade [options]
+
+Options:
+  --rollback   Undo a recent upgrade (revert to git engine on this machine).
+               Restores .git from .git-backup; reloads v0.3 daemon.
+  --finalize   After ~24h of clean Phase-4 operation, remove the
+               .git-backup safety net. Frees ~50% of \$DOTSYNC_DATA_DIR.
+  --force      Skip confirmation prompt.
+  -h, --help   Show this help.
+
+What --upgrade does (default action):
+  1. Pauses the v0.3 launchd daemon and drains pending changes to git.
+  2. Installs Syncthing (brew install syncthing) and starts it.
+  3. Decrypts the data repo's contents in place by removing the
+     git-crypt filters (working tree is already plaintext when
+     git-crypt unlocked).
+  4. Moves \$DOTSYNC_DATA_DIR/.git/ → .git-backup/  (kept for --rollback).
+  5. Adds \$DOTSYNC_DATA_DIR as a Syncthing folder, gets this device's ID.
+  6. Updates \$DOTSYNC_CONFIG with DOTSYNC_ENGINE=syncthing and
+     SYNCTHING_FOLDER_ID, SYNCTHING_API_BASE.
+  7. Reloads our launchd agent (it's now in syncthing mode — capture/
+     rescan/wait/deploy instead of capture/commit/fetch/rebase/push).
+  8. Prints this device's ID.
+
+After upgrading machine 1, upgrade machine 2 ASAP — until both are
+upgraded + re-paired, neither reaches the other. Run sequence above
+documents the re-pair flow.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --rollback) ROLLBACK=true; shift ;;
+    --finalize) FINALIZE=true; shift ;;
+    --force)    FORCE=true; shift ;;
+    -h|--help)  usage; exit 0 ;;
+    *)          echo "unknown flag: $1" >&2; exit 1 ;;
+  esac
+done
+
+step() { printf '\n→ %s\n' "$*"; }
+say()  { printf '  %s\n' "$*"; }
+note() { printf '    (%s)\n' "$*"; }
+
+# ── Subcommand: --finalize ──────────────────────────────────────────
+if $FINALIZE; then
+  [[ -d "$DOTSYNC_DATA_DIR/.git-backup" ]] || die "no .git-backup at $DOTSYNC_DATA_DIR — was this machine upgraded?"
+  if ! $FORCE; then
+    echo "About to permanently delete $DOTSYNC_DATA_DIR/.git-backup."
+    echo "After this, --rollback no longer works on this machine."
+    read -rp "Proceed? Type 'yes' to confirm: " ans
+    [[ "$ans" == "yes" ]] || { echo "aborted"; exit 1; }
+  fi
+  rm -rf "$DOTSYNC_DATA_DIR/.git-backup"
+  echo "✅ finalized — .git-backup removed"
+  exit 0
+fi
+
+# ── Subcommand: --rollback ──────────────────────────────────────────
+if $ROLLBACK; then
+  [[ -d "$DOTSYNC_DATA_DIR/.git-backup" ]] || die "no .git-backup found; can't rollback"
+  if ! $FORCE; then
+    echo "Rolling back to v0.3 git engine. This will:"
+    echo "  - Stop the syncthing engine in our daemon"
+    echo "  - Restore .git from .git-backup"
+    echo "  - Re-encrypt files via git-crypt (no-op if already encrypted in the index)"
+    echo "  - Reload the v0.3 daemon"
+    read -rp "Proceed? Type 'yes' to confirm: " ans
+    [[ "$ans" == "yes" ]] || { echo "aborted"; exit 1; }
+  fi
+
+  step "Restoring git layer"
+  mv "$DOTSYNC_DATA_DIR/.git-backup" "$DOTSYNC_DATA_DIR/.git" || die "couldn't restore .git"
+  say "moved .git-backup → .git"
+
+  step "Reverting config"
+  if [[ -f "$DOTSYNC_CONFIG" ]]; then
+    sed -i.upgrade-bak \
+      -e 's/^DOTSYNC_ENGINE=.*/DOTSYNC_ENGINE="git"/' \
+      "$DOTSYNC_CONFIG"
+    rm -f "$DOTSYNC_CONFIG.upgrade-bak"
+    say "set DOTSYNC_ENGINE=git in $DOTSYNC_CONFIG"
+  fi
+
+  step "Reloading launchd daemon"
+  plist="$HOME/Library/LaunchAgents/$DOTSYNC_KC_SERVICE.plist"
+  if [[ -f "$plist" ]]; then
+    launchctl unload "$plist" 2>/dev/null || true
+    launchctl load -w "$plist" || die "launchctl load failed"
+    say "reloaded $plist"
+  fi
+
+  cat <<EOF
+
+✅ rolled back to v0.3 git engine.
+
+Note: Syncthing's brew service is still installed/running but no longer
+bound to the dotsync folder. Stop it manually if undesired:
+
+  brew services stop syncthing
+EOF
+  exit 0
+fi
+
+# ── Default: upgrade ────────────────────────────────────────────────
+
+# Preflight
+step "Preflight"
+[[ "$(uname -s)" == "Darwin" ]] || die "macOS only"
+command -v brew >/dev/null || die "Homebrew required"
+
+# Sanity: must currently be in git engine mode.
+if [[ "${DOTSYNC_ENGINE:-git}" == "syncthing" ]]; then
+  die "$DOTSYNC_CONFIG already says DOTSYNC_ENGINE=syncthing. Already upgraded?"
+fi
+[[ -d "$DOTSYNC_DATA_DIR/.git" ]] || die "$DOTSYNC_DATA_DIR is not a git repo (already upgraded? or never set up?)"
+
+if ! $FORCE; then
+  cat <<EOF
+
+About to upgrade this machine from git engine to Syncthing engine.
+
+  Data dir:    $DOTSYNC_DATA_DIR
+  Will install: syncthing (via brew)
+  Will move:   $DOTSYNC_DATA_DIR/.git → .git-backup
+  Will update: $DOTSYNC_CONFIG (set DOTSYNC_ENGINE=syncthing)
+
+Reversible via 'dotsync upgrade --rollback' until you run --finalize.
+
+EOF
+  read -rp "Proceed? Type 'yes' to confirm: " ans
+  [[ "$ans" == "yes" ]] || { echo "aborted"; exit 1; }
+fi
+
+# 1. Drain pending git changes.
+step "Draining pending changes (final v0.3 sync)"
+set_paused
+"$SCRIPT_DIR/env-sync" 2>&1 | tail -5 || say "(final sync had warnings; continuing)"
+clear_paused
+say "drained"
+
+# 2. Install + start Syncthing.
+step "Installing Syncthing"
+if ! command -v syncthing >/dev/null; then
+  brew install syncthing >/dev/null || die "brew install syncthing failed"
+  say "installed"
+else
+  note "already installed"
+fi
+
+if ! brew services list 2>/dev/null | grep -q "^syncthing.*started"; then
+  brew services start syncthing >/dev/null 2>&1 || die "brew services start failed"
+  say "started"
+else
+  note "already running"
+fi
+
+ST_API_BASE="${SYNCTHING_API_BASE:-http://127.0.0.1:8384}"
+say "waiting for REST API…"
+for i in {1..30}; do
+  curl -fsS --max-time 2 "$ST_API_BASE/rest/system/ping" >/dev/null 2>&1 && break
+  sleep 1
+done
+curl -fsS --max-time 2 "$ST_API_BASE/rest/system/ping" >/dev/null 2>&1 \
+  || die "Syncthing daemon did not respond after 30s"
+say "ready"
+
+# Cache API key.
+ST_CFG_XML="${HOME}/Library/Application Support/Syncthing/config.xml"
+ST_API_KEY="$(grep -oE '<apikey>[^<]+</apikey>' "$ST_CFG_XML" | head -1 | sed -E 's|</?apikey>||g')"
+[[ -n "$ST_API_KEY" ]] || die "could not extract API key"
+ST_API_KEY_FILE="${HOME}/Library/Application Support/Syncthing/apikey"
+mkdir -p "$(dirname "$ST_API_KEY_FILE")"
+printf '%s' "$ST_API_KEY" > "$ST_API_KEY_FILE"
+chmod 600 "$ST_API_KEY_FILE"
+
+st_curl() {
+  local method="$1" path="$2" body="${3:-}"
+  if [[ -n "$body" ]]; then
+    curl -fsS --max-time 5 -H "X-API-Key: $ST_API_KEY" -H "Content-Type: application/json" \
+      -X "$method" -d "$body" "${ST_API_BASE}${path}"
+  else
+    curl -fsS --max-time 5 -H "X-API-Key: $ST_API_KEY" -X "$method" "${ST_API_BASE}${path}"
+  fi
+}
+
+# 3. Make sure git-crypt unlock has been done so the working tree is plaintext.
+step "Ensuring git-crypt is unlocked"
+unlock_repo
+say "working tree contents: plaintext"
+
+# 4. Move .git aside (preserve as backup for --rollback).
+step "Moving .git → .git-backup"
+mv "$DOTSYNC_DATA_DIR/.git" "$DOTSYNC_DATA_DIR/.git-backup" || die "couldn't move .git"
+say "preserved at $DOTSYNC_DATA_DIR/.git-backup"
+
+# Drop git-crypt's working-tree marker too (no longer needed; the .git-crypt
+# dir is a sibling of the encrypted files, not inside .git).
+[[ -d "$DOTSYNC_DATA_DIR/.git-crypt" ]] && \
+  mv "$DOTSYNC_DATA_DIR/.git-crypt" "$DOTSYNC_DATA_DIR/.git-crypt-backup"
+
+# 5. Add the folder to Syncthing.
+step "Configuring Syncthing folder"
+MY_DEVICE_ID=$(st_curl GET /rest/system/status | jq -r '.myID')
+[[ -n "$MY_DEVICE_ID" && "$MY_DEVICE_ID" != "null" ]] || die "could not retrieve device ID"
+say "this device: $MY_DEVICE_ID"
+
+FOLDER_ID="${SYNCTHING_FOLDER_ID:-dotsync-data}"
+folder_payload=$(jq -n \
+  --arg id "$FOLDER_ID" \
+  --arg path "$DOTSYNC_DATA_DIR" \
+  --arg dev "$MY_DEVICE_ID" \
+  '{
+    id: $id,
+    label: "dotsync data",
+    path: $path,
+    type: "sendreceive",
+    devices: [{ deviceID: $dev }],
+    fsWatcherEnabled: true,
+    rescanIntervalS: 60
+  }')
+
+existing=$(st_curl GET "/rest/config/folders/$FOLDER_ID" 2>/dev/null || echo "")
+if [[ -n "$existing" && "$existing" != "null" ]]; then
+  note "folder $FOLDER_ID already configured"
+else
+  st_curl POST /rest/config/folders "$folder_payload" >/dev/null \
+    || die "failed to create Syncthing folder"
+  say "created folder $FOLDER_ID"
+fi
+
+# 6. Update the dotsync config.
+step "Updating $DOTSYNC_CONFIG"
+# Append/replace engine settings.
+tmp=$(mktemp)
+{
+  grep -v '^DOTSYNC_ENGINE=\|^SYNCTHING_FOLDER_ID=\|^SYNCTHING_API_BASE=\|^DOTSYNC_DATA_REMOTE=\|^DOTSYNC_DATA_BRANCH=' "$DOTSYNC_CONFIG" 2>/dev/null
+  echo "DOTSYNC_ENGINE=\"syncthing\""
+  echo "SYNCTHING_FOLDER_ID=\"$FOLDER_ID\""
+  echo "SYNCTHING_API_BASE=\"$ST_API_BASE\""
+  echo "# DOTSYNC_DATA_REMOTE / DATA_BRANCH removed by 'dotsync upgrade' — repo is no longer the sync layer."
+} > "$tmp"
+mv "$tmp" "$DOTSYNC_CONFIG"
+say "set DOTSYNC_ENGINE=syncthing"
+
+# 7. Reload our launchd agent.
+step "Reloading dotsync launchd agent"
+plist="$HOME/Library/LaunchAgents/$DOTSYNC_KC_SERVICE.plist"
+if [[ -f "$plist" ]]; then
+  launchctl unload "$plist" 2>/dev/null || true
+  launchctl load -w "$plist" || die "launchctl load failed"
+  say "reloaded — daemon is now in syncthing mode"
+fi
+
+# 8. Done.
+cat <<EOF
+
+✅ Upgraded to Syncthing engine.
+
+  Engine:        syncthing
+  Data dir:      $DOTSYNC_DATA_DIR
+  Folder ID:     $FOLDER_ID
+  This device:   $MY_DEVICE_ID
+  Backups kept:  .git-backup (rollback safety net)
+
+To re-pair with another machine, run on it:
+
+  dotsync upgrade           # flip it to syncthing too
+
+Then on this (the first) machine:
+
+  dotsync pair              # prints a wormhole code
+
+On the other machine:
+
+  dotsync join --code <code>   # adds us as a peer; prints add-peer cmd
+
+Back here:
+
+  dotsync add-peer <id>     # completes the bidirectional pairing
+
+After ~24 hours of clean operation:
+
+  dotsync upgrade --finalize   # removes .git-backup permanently
+
+If anything's wrong:
+
+  dotsync upgrade --rollback   # restores v0.3 git engine
+EOF
