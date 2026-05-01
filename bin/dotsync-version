@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# dotsync-version — print version info.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Pull version from the dispatcher (single source of truth).
+VERSION=$(grep -E '^VERSION=' "$SCRIPT_DIR/dotsync" | head -1 | sed 's/^VERSION="\(.*\)".*/\1/')
+
+if [[ "${1:-}" == "--json" ]]; then
+  printf '{"version":"%s","tool_dir":"%s"}\n' "$VERSION" "$(dirname "$SCRIPT_DIR")"
+else
+  echo "dotsync ${VERSION}"
+  echo "  tool: $(dirname "$SCRIPT_DIR")"
+fi

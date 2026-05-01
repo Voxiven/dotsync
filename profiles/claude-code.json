@@ -1,0 +1,50 @@
+{
+  "name": "claude-code",
+  "schema_version": 1,
+  "description": "Claude Code: sessions, memory, settings, agents, commands",
+  "homepage": "https://docs.claude.com/en/docs/claude-code",
+  "iterates_per_project": true,
+  "paths": [
+    {
+      "id": "settings",
+      "type": "file",
+      "from": "${HOME}/.claude/settings.json",
+      "to": "claude-code/dotfiles/settings.json",
+      "skip_if_empty": true
+    },
+    {
+      "id": "claude_md",
+      "type": "file",
+      "from": "${HOME}/.claude/CLAUDE.md",
+      "to": "claude-code/dotfiles/CLAUDE.md",
+      "skip_if_empty": true
+    },
+    {
+      "id": "agents",
+      "type": "directory",
+      "from": "${HOME}/.claude/agents/",
+      "to": "claude-code/agents/"
+    },
+    {
+      "id": "commands",
+      "type": "directory",
+      "from": "${HOME}/.claude/commands/",
+      "to": "claude-code/commands/"
+    },
+    {
+      "id": "sessions",
+      "type": "session_jsonls",
+      "from": "${HOME}/.claude/projects/${CC_ENCODED}/",
+      "to": "claude-code/sessions/${PROJECT}/",
+      "include_globs": ["*.jsonl"],
+      "exclude_dirs": ["subagents"],
+      "max_file_mb": 50
+    },
+    {
+      "id": "memory",
+      "type": "shared_per_project_symlink",
+      "real": "${HOME}/.claude/projects/${CC_ENCODED}/memory",
+      "shared": "claude-code/memory/"
+    }
+  ]
+}

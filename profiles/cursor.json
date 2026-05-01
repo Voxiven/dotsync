@@ -1,0 +1,29 @@
+{
+  "name": "cursor",
+  "schema_version": 1,
+  "description": "Cursor settings + chat history (experimental, untested)",
+  "experimental": true,
+  "iterates_per_project": false,
+  "paths": [
+    {
+      "id": "settings",
+      "type": "file",
+      "from": "${HOME}/Library/Application Support/Cursor/User/settings.json",
+      "to": "cursor/settings.json",
+      "skip_if_missing": true
+    },
+    {
+      "id": "keybindings",
+      "type": "file",
+      "from": "${HOME}/Library/Application Support/Cursor/User/keybindings.json",
+      "to": "cursor/keybindings.json",
+      "skip_if_missing": true
+    },
+    {
+      "id": "snippets",
+      "type": "directory",
+      "from": "${HOME}/Library/Application Support/Cursor/User/snippets/",
+      "to": "cursor/snippets/"
+    }
+  ]
+}

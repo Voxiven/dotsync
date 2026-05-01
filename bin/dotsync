@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# dotsync — main dispatcher. Routes to bin/dotsync-<subcommand>.
+# Pattern: like git, hg, kubectl. `dotsync foo` execs `dotsync-foo`.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+VERSION="0.3.0-dev"
+
+usage() {
+  cat <<EOF
+dotsync ${VERSION} — multi-machine continuity for AI dev tools
+
+Usage: dotsync <command> [args...]
+
+Setup (run once per machine):
+  init                Set up dotsync on the first machine
+  join                Set up dotsync on a second machine (pair w/ first)
+  pair                Generate a one-time pairing code (called from join)
+
+Daily use:
+  status              One-line summary of sync state
+  sync                Force a sync now (daemon usually does this every 60s)
+  ui                  Open status dashboard at http://127.0.0.1:7878
+  pause / resume      Halt or restart the sync daemon
+
+Profiles (per-tool sync configurations):
+  profiles            List available + enabled profiles
+  enable <profile>    Turn on a profile (e.g. claude-code, project-secrets)
+  disable <profile>   Turn off a profile
+
+Tracked items:
+  track <path>        Add an ad-hoc path to sync
+  untrack <pattern>   Remove
+  list                Show everything tracked, by profile
+
+Conflicts & logs:
+  resolve             Interactive conflict resolution
+  logs [--tail]       Show sync log
+
+Help:
+  help [command]      Show help for a command
+  version             Print dotsync version
+
+EOF
+}
+
+if [[ $# -eq 0 ]]; then
+  usage
+  exit 0
+fi
+
+cmd="$1"; shift
+
+case "$cmd" in
+  -h|--help|help)
+    if [[ $# -gt 0 ]]; then
+      sub="$SCRIPT_DIR/dotsync-$1"
+      [[ -x "$sub" ]] && exec "$sub" --help || { echo "dotsync: unknown command: $1" >&2; exit 1; }
+    else
+      usage
+    fi
+    ;;
+  -V|--version|version)
+    echo "dotsync ${VERSION}"
+    ;;
+  *)
+    sub="$SCRIPT_DIR/dotsync-$cmd"
+    if [[ -x "$sub" ]]; then
+      exec "$sub" "$@"
+    else
+      # Backward-compat: dotsync sync → bin/env-sync (until env-sync is renamed).
+      legacy="$SCRIPT_DIR/env-$cmd"
+      if [[ -x "$legacy" ]]; then
+        exec "$legacy" "$@"
+      fi
+      echo "dotsync: unknown command: $cmd" >&2
+      echo "Try 'dotsync help' for a list of commands." >&2
+      exit 1
+    fi
+    ;;
+esac

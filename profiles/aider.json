@@ -1,0 +1,30 @@
+{
+  "name": "aider",
+  "schema_version": 1,
+  "description": "Aider config + chat history (experimental, untested)",
+  "experimental": true,
+  "iterates_per_project": true,
+  "paths": [
+    {
+      "id": "global_config",
+      "type": "file",
+      "from": "${HOME}/.aider.conf.yml",
+      "to": "aider/aider.conf.yml",
+      "skip_if_missing": true
+    },
+    {
+      "id": "global_input_history",
+      "type": "file",
+      "from": "${HOME}/.aider.input.history",
+      "to": "aider/input.history",
+      "skip_if_missing": true
+    },
+    {
+      "id": "project_chat_history",
+      "type": "file",
+      "from": "${DOTSYNC_PROJECT_ROOT}/${PROJECT}/.aider.chat.history.md",
+      "to": "aider/projects/${PROJECT}/chat.history.md",
+      "skip_if_missing": true
+    }
+  ]
+}

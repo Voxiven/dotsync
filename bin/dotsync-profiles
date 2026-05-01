@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# dotsync-profiles — list available + enabled profiles.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_common.sh"
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  cat <<EOF
+dotsync profiles — list available and enabled profiles.
+
+Usage: dotsync profiles [--json]
+
+A profile is a JSON file in $(dirname "$SCRIPT_DIR")/profiles/ that
+declares the paths a particular tool wants synced.
+
+Enable one with: dotsync enable <profile-name>
+EOF
+  exit 0
+fi
+
+json=false
+[[ "${1:-}" == "--json" ]] && json=true
+
+PROFILES_DIR="$(dirname "$SCRIPT_DIR")/profiles"
+ENABLED_FILE="$DOTSYNC_DATA_DIR/registry/enabled-profiles.json"
+
+# Read enabled list (default: empty).
+enabled_list=""
+if [[ -f "$ENABLED_FILE" ]]; then
+  enabled_list="$(jq -r '.profiles[]? // empty' "$ENABLED_FILE" 2>/dev/null | tr '\n' ' ')"
+fi
+
+is_enabled() {
+  [[ " $enabled_list " == *" $1 "* ]]
+}
+
+if $json; then
+  jq -s --arg enabled "$enabled_list" '{
+    profiles: map({
+      name: .name,
+      description: .description,
+      experimental: (.experimental // false),
+      enabled: ($enabled | split(" ") | map(select(length > 0)) | index(.name) != null)
+    })
+  }' "$PROFILES_DIR"/*.json
+  exit 0
+fi
+
+# Human-readable.
+printf 'Available profiles:\n\n'
+for p in "$PROFILES_DIR"/*.json; do
+  [[ -f "$p" ]] || continue
+  name=$(jq -r '.name' "$p" 2>/dev/null)
+  desc=$(jq -r '.description' "$p" 2>/dev/null)
+  exp=$(jq -r '.experimental // false' "$p" 2>/dev/null)
+
+  [[ -z "$name" ]] && continue
+
+  if is_enabled "$name"; then
+    glyph="[x]"
+  else
+    glyph="[ ]"
+  fi
+
+  exp_tag=""
+  [[ "$exp" == "true" ]] && exp_tag=" (experimental)"
+
+  printf '  %s %-20s %s%s\n' "$glyph" "$name" "$desc" "$exp_tag"
+done
+
+if [[ -z "$enabled_list" ]]; then
+  printf '\nNo profiles enabled. Try: dotsync enable claude-code\n'
+fi

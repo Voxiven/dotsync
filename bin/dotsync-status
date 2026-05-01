@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+# dotsync-status — one-line summary of sync health.
+# Reads existing state files (last-sync timestamp, paused flag, conflict
+# dirs, daemon status) — no new state introduced.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_common.sh"
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  cat <<EOF
+dotsync status — one-line summary of sync state.
+
+Usage: dotsync status [--json]
+
+Exits non-zero if sync is paused or has unresolved conflicts.
+EOF
+  exit 0
+fi
+
+json=false
+[[ "${1:-}" == "--json" ]] && json=true
+
+# Gather state.
+last_sync=""
+[[ -f "$ENV_LASTSYNC_FILE" ]] && last_sync="$(cat "$ENV_LASTSYNC_FILE" 2>/dev/null)"
+
+paused="false"
+is_paused && paused="true"
+
+conflicts=0
+if [[ -d "$ENV_CONFLICTS_DIR" ]]; then
+  conflicts=$(find "$ENV_CONFLICTS_DIR" -mindepth 1 -maxdepth 1 -type d -not -name '_resolved' 2>/dev/null | wc -l | tr -d ' ')
+fi
+
+daemon_state="unknown"
+if command -v launchctl >/dev/null 2>&1; then
+  if launchctl list 2>/dev/null | grep -q "$DOTSYNC_KC_SERVICE"; then
+    daemon_state="loaded"
+  else
+    daemon_state="not-loaded"
+  fi
+fi
+
+repo_branch="?"
+if [[ -d "$DOTSYNC_DATA_DIR/.git" ]]; then
+  repo_branch="$(git -C "$DOTSYNC_DATA_DIR" rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+fi
+
+# Exit code: 0 = healthy, 1 = paused, 2 = conflicts, 3 = both.
+exit_code=0
+[[ "$paused" == "true" ]] && exit_code=$((exit_code | 1))
+[[ "$conflicts" -gt 0 ]] && exit_code=$((exit_code | 2))
+
+if $json; then
+  printf '{"service":"%s","data_dir":"%s","branch":"%s","last_sync":"%s","paused":%s,"conflicts":%d,"daemon":"%s"}\n' \
+    "$DOTSYNC_KC_SERVICE" "$DOTSYNC_DATA_DIR" "$repo_branch" "$last_sync" "$paused" "$conflicts" "$daemon_state"
+  exit $exit_code
+fi
+
+# Human-readable one-liner first, then a few details.
+status_glyph="✓"
+[[ "$paused" == "true" ]] && status_glyph="⏸"
+[[ "$conflicts" -gt 0 ]] && status_glyph="⚠"
+
+summary_parts=("$DOTSYNC_KC_SERVICE")
+[[ -n "$last_sync" ]] && summary_parts+=("last sync $last_sync")
+[[ "$conflicts" -gt 0 ]] && summary_parts+=("$conflicts conflicts")
+[[ "$paused" == "true" ]] && summary_parts+=("PAUSED")
+summary_parts+=("daemon: $daemon_state")
+
+# Join with " — "
+printf '%s ' "$status_glyph"
+sep=""
+for p in "${summary_parts[@]}"; do
+  printf '%s%s' "$sep" "$p"
+  sep=" — "
+done
+printf '\n'
+
+# Hints when something needs attention.
+if [[ "$paused" == "true" ]]; then
+  echo "  hint: run 'dotsync resolve' to handle conflicts and resume"
+elif [[ "$conflicts" -gt 0 ]]; then
+  echo "  hint: $conflicts unresolved conflict(s) at $ENV_CONFLICTS_DIR — run 'dotsync resolve'"
+fi
+
+exit $exit_code
