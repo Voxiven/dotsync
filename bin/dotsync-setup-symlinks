@@ -72,12 +72,18 @@ if $DRY_RUN; then
   exit 0
 fi
 
+# Run BOTH capture and deploy. In syncthing mode they're idempotent for
+# symlink_* path types (both wire the link). The shared_per_project_symlink
+# type does its wiring in deploy specifically (capture is a no-op),
+# so calling both ensures memory symlinks get re-pointed too.
 if [[ -n "$ONLY_PROFILE" ]]; then
   log_info "wiring symlinks for profile: $ONLY_PROFILE"
   profile_run "$ONLY_PROFILE" capture
+  profile_run "$ONLY_PROFILE" deploy
 else
   log_info "wiring symlinks for all enabled profiles: $(enabled_profiles | tr '\n' ' ')"
   profile_run_all capture
+  profile_run_all deploy
 fi
 
 echo "✓ symlinks wired"
