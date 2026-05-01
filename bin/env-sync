@@ -100,6 +100,14 @@ if ! st_running; then
   exit 0
 fi
 
+# 0. Self-heal .stignore. Per-machine file (Syncthing doesn't replicate
+#    it), so a peer joined before this rule existed — or a peer where
+#    it got deleted — can quietly miss the sidecar exclusion and start
+#    re-pulling phantom conflict files from its index every drain. The
+#    helper is content-aware, so this is free on the happy path; logs
+#    only when it actually heals something.
+st_write_stignore
+
 # 1. Capture local-machine state into the data dir. Syncthing replicates
 #    async. Symlinked profile paths are no-ops here (already in-place);
 #    only non-symlink paths (sessions, project-secrets) do real work.

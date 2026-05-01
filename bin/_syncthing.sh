@@ -131,9 +131,11 @@ st_list_conflicts() {
   find "$ENV_REPO_ROOT" -name '*.sync-conflict-*' -type f 2>/dev/null
 }
 
-# Write/update the .stignore in the data dir. Idempotent. .stignore is a
-# per-machine file (not replicated by Syncthing — that's the whole point);
-# we maintain it identically on every machine.
+# Write/update the .stignore in the data dir. Content-aware: a no-op
+# when the file already matches, so env-sync can call it every cycle
+# without log spam. .stignore is a per-machine file (not replicated by
+# Syncthing — that's the whole point); we maintain it identically on
+# every machine. Returns 0 always; logs only when it heals something.
 #
 # Patterns: per-machine dotsync state files (safety net — they should
 # already live in $DOTSYNC_STATE_DIR after Phase 4.8, but if anything
@@ -142,10 +144,13 @@ st_list_conflicts() {
 st_write_stignore() {
   [[ -d "$ENV_REPO_ROOT" ]] || return 0
   local f="$ENV_REPO_ROOT/.stignore"
-  cat > "$f" <<'EOF'
-// dotsync — written by 'dotsync init' / 'setup-symlinks'. Edit at your
-// own risk; entries below prevent Syncthing from creating spurious
-// conflict files on machine-local state.
+  local tmp
+  tmp=$(mktemp) || return 0
+  cat > "$tmp" <<'EOF'
+// dotsync — written by 'dotsync init' / 'setup-symlinks' / env-sync
+// (self-heal each cycle). Edit at your own risk; entries below prevent
+// Syncthing from creating spurious conflict files on machine-local
+// state.
 
 // Per-machine dotsync state (should already live in ~/.dotsync-state/,
 // but ignore here defensively in case something writes them in-folder).
@@ -164,4 +169,16 @@ st_write_stignore() {
 .DS_Store
 **/.DS_Store
 EOF
+  if [[ ! -f "$f" ]]; then
+    mv "$tmp" "$f"
+    log_info "stignore: created at $f"
+    return 0
+  fi
+  if ! cmp -s "$tmp" "$f"; then
+    mv "$tmp" "$f"
+    log_info "stignore: updated (content drifted from canonical)"
+    return 0
+  fi
+  rm -f "$tmp"
+  return 0
 }

@@ -9,6 +9,12 @@ load test_helper
 setup() { sandbox_setup; }
 teardown() { sandbox_teardown; }
 
+_load_syncthing() {
+  source_internals
+  # shellcheck source=/dev/null
+  source "$TOOL_DIR/bin/_syncthing.sh"
+}
+
 @test "ENV_LASTSYNC_FILE is in DOTSYNC_STATE_DIR, not DOTSYNC_DATA_DIR" {
   source_internals
   [[ "$ENV_LASTSYNC_FILE" == "$DOTSYNC_STATE_DIR/last-sync" ]]
@@ -48,4 +54,31 @@ teardown() { sandbox_teardown; }
   is_paused
   clear_paused
   ! is_paused
+}
+
+@test "st_write_stignore: creates .stignore when missing" {
+  _load_syncthing
+  [[ ! -f "$DOTSYNC_DATA_DIR/.stignore" ]]
+  st_write_stignore
+  [[ -f "$DOTSYNC_DATA_DIR/.stignore" ]]
+  grep -q "*.sync-conflict-*" "$DOTSYNC_DATA_DIR/.stignore"
+  grep -q "subagents" "$DOTSYNC_DATA_DIR/.stignore"
+}
+
+@test "st_write_stignore: idempotent — no rewrite when content matches" {
+  _load_syncthing
+  st_write_stignore
+  local mt1; mt1=$(stat -f '%m' "$DOTSYNC_DATA_DIR/.stignore")
+  sleep 1
+  st_write_stignore
+  local mt2; mt2=$(stat -f '%m' "$DOTSYNC_DATA_DIR/.stignore")
+  [[ "$mt1" == "$mt2" ]]
+}
+
+@test "st_write_stignore: heals when content drifted" {
+  _load_syncthing
+  echo "bad content" > "$DOTSYNC_DATA_DIR/.stignore"
+  st_write_stignore
+  grep -q "*.sync-conflict-*" "$DOTSYNC_DATA_DIR/.stignore"
+  ! grep -q "bad content" "$DOTSYNC_DATA_DIR/.stignore"
 }
