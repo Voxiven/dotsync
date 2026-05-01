@@ -142,12 +142,48 @@ while read -r proj; do
 done < <(project_names)
 
 mkdir -p "$DOTSYNC_DATA_DIR/dotfiles"
-[[ -f "$DOTSYNC_DATA_DIR/dotfiles/settings.json" ]] || touch "$DOTSYNC_DATA_DIR/dotfiles/settings.json"
-[[ -f "$DOTSYNC_DATA_DIR/dotfiles/CLAUDE.md" ]]     || touch "$DOTSYNC_DATA_DIR/dotfiles/CLAUDE.md"
-backup_if_exists "$HOME/.claude/settings.json"
-backup_if_exists "$HOME/.claude/CLAUDE.md"
-ln -sfn "$DOTSYNC_DATA_DIR/dotfiles/settings.json" "$HOME/.claude/settings.json"
-ln -sfn "$DOTSYNC_DATA_DIR/dotfiles/CLAUDE.md"     "$HOME/.claude/CLAUDE.md"
+# Dotfiles are sync'd via capture/deploy (cp), not symlinks. Symlinking puts
+# the data repo's working tree directly under the path Claude Code writes
+# to (e.g. ~/.claude/settings.json), which races env-sync's rebase: a write
+# between the autostash and the internal checkout makes rebase abort with
+# "Your local changes to ... would be overwritten by checkout."
+while IFS=$'\t' read -r repo_p real_p; do
+  repo_full="$DOTSYNC_DATA_DIR/$repo_p"
+  mkdir -p "$(dirname "$repo_full")"
+
+  # Migrate legacy symlink → real file. Snapshot the symlink target's
+  # current content (live process may have written to it), drop the link,
+  # restore as a regular file.
+  if [[ -L "$real_p" ]]; then
+    target="$(readlink "$real_p")"
+    if [[ "$target" == "$repo_full" ]]; then
+      log_info "migrating symlink → copy: $real_p"
+      tmp="$(mktemp)"
+      cp "$real_p" "$tmp" 2>/dev/null || true   # snapshot via the symlink
+      rm "$real_p"
+      [[ -s "$tmp" ]] && mv "$tmp" "$real_p" || rm -f "$tmp"
+    fi
+  fi
+
+  # Seed direction:
+  #   - real exists, repo missing/empty → seed repo from real (first machine)
+  #   - repo exists, real missing       → deploy repo to real (joining machine)
+  #   - both exist                       → leave alone; sync will reconcile
+  if [[ -f "$real_p" && ! -L "$real_p" ]]; then
+    if [[ ! -s "$repo_full" ]]; then
+      cp "$real_p" "$repo_full"
+      log_info "seeded $repo_p from $real_p"
+    fi
+  elif [[ -f "$repo_full" ]]; then
+    mkdir -p "$(dirname "$real_p")"
+    cp "$repo_full" "$real_p"
+    log_info "deployed $repo_p → $real_p"
+  else
+    # Neither side has content; create empty placeholders so capture/deploy
+    # don't skip on subsequent runs.
+    touch "$repo_full"
+  fi
+done < <(dotfile_pairs)
 
 # 10. First-machine seeding: if data dir is still empty, copy from backup.
 seed_from_backup() {
@@ -162,13 +198,8 @@ for backup_memory in "$BACKUP_DIR"/.claude/projects/*/memory; do
   seed_from_backup "$backup_memory" "$SHARED_MEMORY" "memory"
   break
 done
-if [[ ! -s "$DOTSYNC_DATA_DIR/dotfiles/settings.json" && -f "$BACKUP_DIR/.claude/settings.json" ]]; then
-  cp "$BACKUP_DIR/.claude/settings.json" "$DOTSYNC_DATA_DIR/dotfiles/settings.json"
-  log_info "seeded dotfiles/settings.json from backup"
-fi
-if [[ ! -s "$DOTSYNC_DATA_DIR/dotfiles/CLAUDE.md" && -f "$BACKUP_DIR/.claude/CLAUDE.md" ]]; then
-  cp "$BACKUP_DIR/.claude/CLAUDE.md" "$DOTSYNC_DATA_DIR/dotfiles/CLAUDE.md"
-fi
+# Dotfile seeding is handled inline by the dotfile_pairs loop in step 9
+# (since v0.3 — dotfiles are no longer symlinked).
 
 # 11. Capture tracked .env files.
 step "Capturing tracked .env files"

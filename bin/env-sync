@@ -23,6 +23,29 @@ capture_secrets() {
   done < <(secrets_pairs)
 }
 
+# Capture dotfiles from $HOME into the repo. Skip symlinks — those are a
+# legacy install pattern that gets converted to copies on the next
+# env-bootstrap run.
+capture_dotfiles() {
+  local repo_p real_p
+  while IFS=$'\t' read -r repo_p real_p; do
+    [[ -f "$real_p" && ! -L "$real_p" ]] || continue
+    mkdir -p "$(dirname "$ENV_REPO_ROOT/$repo_p")"
+    rsync -a --checksum "$real_p" "$ENV_REPO_ROOT/$repo_p"
+  done < <(dotfile_pairs)
+}
+
+deploy_dotfiles() {
+  local repo_p real_p
+  while IFS=$'\t' read -r repo_p real_p; do
+    [[ -f "$ENV_REPO_ROOT/$repo_p" ]] || continue
+    # Don't clobber a legacy symlink — env-bootstrap migrates those.
+    [[ -L "$real_p" ]] && continue
+    mkdir -p "$(dirname "$real_p")"
+    rsync -a --checksum "$ENV_REPO_ROOT/$repo_p" "$real_p"
+  done < <(dotfile_pairs)
+}
+
 deploy_sessions() {
   local proj
   while read -r proj; do
@@ -124,6 +147,7 @@ cd "$ENV_REPO_ROOT" || die "cannot cd to $ENV_REPO_ROOT"
 #    working tree is dirty from a prior run or external edit.
 capture_secrets
 capture_sessions
+capture_dotfiles
 prune_sessions
 
 if [[ -n "$(git status --porcelain)" ]]; then
@@ -161,6 +185,7 @@ fi
 # 3. Deploy the merged state to canonical paths.
 deploy_secrets
 deploy_sessions
+deploy_dotfiles
 
 # 4. Push any local commits we made in step 1.
 if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/"$DOTSYNC_DATA_BRANCH")" ]]; then

@@ -58,3 +58,15 @@ expand_path() {
   p="${p//\$\{PROJECT_ROOT\}/$proot}"
   echo "$p"
 }
+
+# Emit pairs: "<repo_path>\t<real_path>" for tracked dotfiles.
+# Synced via capture/deploy (cp), NOT symlinks — a live process like Claude
+# Code writes to ~/.claude/settings.json on every state change, which
+# would race the rebase's internal checkout when the symlink target lives
+# in the data repo's working tree.
+dotfile_pairs() {
+  cat <<EOF
+dotfiles/settings.json	${HOME}/.claude/settings.json
+dotfiles/CLAUDE.md	${HOME}/.claude/CLAUDE.md
+EOF
+}
