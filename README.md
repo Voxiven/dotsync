@@ -93,7 +93,32 @@ Done. Both Syncthing daemons connect, the folder replicates, your CC content syn
 ```bash
 dotsync status         # one-line health
 dotsync ui             # opens dashboard at http://127.0.0.1:7878
+dotsync ui --share     # public URL for any device (token-protected)
+dotsync doctor         # 25-check diagnostic
 ```
+
+## Cross-network: pairing and syncing across the internet
+
+dotsync works the same whether your machines are on the same WiFi or scattered across continents. There's no LAN requirement and no tunnel to set up:
+
+- **`dotsync pair` / `dotsync join`** uses [magic-wormhole](https://magic-wormhole.readthedocs.io/) — the pairing code travels over the public wormhole relays, not your LAN.
+- **Sync** rides on Syncthing's defaults: global discovery so peers find each other anywhere by device ID; NAT traversal (UPnP + hole-punching) for direct connections; public TLS-encrypted relays as fallback when both peers are behind hostile NATs. Your data is end-to-end encrypted on all paths — relays see TLS bytes only.
+- **`dotsync doctor`** confirms global discovery / relays / NAT traversal are enabled. They're on by default.
+
+### Remote dashboard
+
+The dashboard is localhost-only by default. To peek at sync state from your phone or another machine:
+
+```bash
+dotsync ui --share
+# Public URL: https://random-words.trycloudflare.com/?token=<long-token>
+```
+
+This spawns a [Cloudflare quick tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/do-more-with-tunnels/trycloudflare/) — no Cloudflare account, no signup, free, ephemeral hostname. Combined with a per-machine 256-bit token (stored at `~/.dotsync-state/ui-token`, mode 600), only someone holding the token can reach the dashboard. Token persists in browser `localStorage` after the first visit, so you can refresh without re-pasting.
+
+For persistent share URLs, set up a [named Cloudflare tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) (still free, requires a CF account) and point it at `http://127.0.0.1:7878` — the dotsync token-auth still applies. Or skip cloudflared entirely and use Tailscale: `brew install tailscale && dotsync ui --bind <tailnet-ip>`.
+
+Requires `cloudflared` for `--share` mode: `brew install cloudflared`.
 
 ## How it works
 
@@ -147,8 +172,10 @@ Setup
 
 Daily use
   status            One-line health (last sync, daemon, conflicts)
+  doctor            Run 25 setup + connectivity checks with hints
   sync              Force a sync now (daemon does this every 60s)
   ui                Open status dashboard at http://127.0.0.1:7878
+  ui --share        Token-protected public URL via cloudflared quick tunnel
   pause / resume    Halt or restart the dotsync agent
 
 Profiles
@@ -179,6 +206,7 @@ Run `dotsync <command> --help` for per-command details.
 | **Syncthing's discovery servers** | See only device IDs (public identifiers) — never content |
 | **Cloud provider** | None involved. dotsync is peer-to-peer; your data never leaves your machines |
 | **Stolen Mac** | macOS user-account login + FileVault is your defense — same as for CC's own data, which already lives in `~/.claude/` plaintext |
+| **`dotsync ui --share` URL leaks** | Tunnel hosts the dashboard, but every request requires a 256-bit token (`~/.dotsync-state/ui-token`, mode 600). Without the token an attacker hits a login page; with it they can read state and trigger sync/pause/clean-conflicts (no file content is exposed beyond status JSON). Quick-tunnel hostnames rotate per `--share` session. Treat the token as a password. |
 
 Files on disk are plaintext on each peer. This is **the same security envelope CC's own data already has** — `~/.claude/projects/*/*.jsonl` and `~/.claude/settings.json` are already plaintext on every machine that runs CC. Encrypting them in the dotsync folder while leaving them plaintext at their canonical path would be theater, not security.
 
@@ -207,16 +235,19 @@ Multiple parallel setups (work + personal) are supported by overriding `DOTSYNC_
 - Symlinks for most paths (real-time sync, no daemon work for those)
 - Profile system: `claude-code`, `project-secrets`, plus experimental `cursor`/`aider`
 - One-command setup (`init` → `pair` → `join` → `add-peer`)
-- Web dashboard at `localhost:7878`
-- `dotsync uninstall` / `dotsync setup-symlinks` / `dotsync no-daemon`
+- Cross-network pairing (magic-wormhole) and sync (Syncthing global discovery + relays)
+- Token-protected web dashboard at `localhost:7878`, optional public URL via `ui --share`
+- JSONL line-union merge for session conflicts (`clean-conflicts --merge`)
+- `dotsync doctor` — 25-check setup + connectivity diagnostic
+- Homebrew tap (`brew tap voxiven/tap && brew install dotsync`)
+- 38 bats-core tests
+- `dotsync uninstall` / `setup-symlinks` / `no-daemon`
 
 **Next:**
 - Linux support (systemd-user units instead of launchd; libsecret instead of Keychain)
-- Homebrew tap for one-line install
-- `dotsync doctor` self-diagnostic command
-- Bats-core test suite
 - Full project-dir symlinks for sessions (eliminate the polling agent entirely)
 - More tested profiles (Cursor, Aider, Continue.dev, Zed assistant)
+- Persistent named-tunnel mode for `ui --share` (stable URL, requires CF account)
 
 ## Contributing
 
