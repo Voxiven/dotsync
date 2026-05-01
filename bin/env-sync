@@ -5,6 +5,7 @@ source "$SCRIPT_DIR/_common.sh"
 source "$SCRIPT_DIR/_crypt.sh"
 source "$SCRIPT_DIR/_registry.sh"
 source "$SCRIPT_DIR/_profile.sh"
+source "$SCRIPT_DIR/_syncthing.sh"
 
 deploy_secrets() {
   local repo_p real_p
@@ -171,81 +172,123 @@ if is_paused; then
   exit 0
 fi
 
-unlock_repo
 cd "$ENV_REPO_ROOT" || die "cannot cd to $ENV_REPO_ROOT"
 
-# 1. Capture local-machine state FIRST so any pending edits land in a commit
-#    before we fetch/rebase. Avoids "unstaged changes" rebase aborts when the
-#    working tree is dirty from a prior run or external edit.
-# Capture: in profile mode, use the declarative profile engine for
-# tool-specific paths; in legacy mode, use the hardcoded capture_*
-# functions. capture_secrets always runs because ad-hoc tracked items
-# (registered via 'dotsync track') live in secrets.json regardless of
-# profile mode.
-capture_secrets
-if profile_mode_active; then
-  log_info "profile mode: $(enabled_profiles | tr '\n' ' ')"
-  profile_run_all capture
-else
-  migrate_session_layout
-  capture_sessions
-  capture_dotfiles
-fi
-prune_sessions
+# ──────────────────────────────────────────────────────────────────────
+# Engine: syncthing | git
+#   syncthing — Syncthing daemon replicates the data dir; we just capture
+#               and deploy. No git ops, no rebase, no smudge filters.
+#   git       — legacy v0.3 path: capture → commit → fetch → rebase →
+#               deploy → push.
+# ──────────────────────────────────────────────────────────────────────
 
-if [[ -n "$(git status --porcelain)" ]]; then
-  git add -A
-  git commit -m "auto-sync $(hostname -s) $(date -u +%Y-%m-%dT%H:%M:%SZ)" --quiet \
-    || die "commit failed"
-fi
+if syncthing_mode; then
+  # ── Syncthing engine ────────────────────────────────────────────────
+  if ! st_running; then
+    log_warn "Syncthing daemon not reachable at $SYNCTHING_API_BASE; skipping sync"
+    exit 0
+  fi
 
-# 2. Pull remote changes.
-git fetch origin "$DOTSYNC_DATA_BRANCH" --quiet || die "git fetch failed"
-
-local_sha="$(git rev-parse HEAD)"
-remote_sha="$(git rev-parse origin/"$DOTSYNC_DATA_BRANCH")"
-
-if [[ "$local_sha" != "$remote_sha" ]]; then
-  # Both branches handle a real race: a long-lived process (Claude Code, an
-  # editor) writes through a symlink into the working tree between step 1's
-  # commit and the merge/rebase's internal checkout. Without autostash,
-  # the operation aborts with "Your local changes to ... would be overwritten
-  # by checkout". `merge.autoStash` (git 2.27+) and `rebase --autostash` make
-  # the operation transparent to such concurrent writes.
-  if git merge-base --is-ancestor "$local_sha" "$remote_sha"; then
-    log_info "fast-forward to $remote_sha"
-    git -c merge.autoStash=true merge --ff-only "$remote_sha" --quiet \
-      || die "ff merge failed"
+  # 1. Capture local state into the data dir. Syncthing replicates async.
+  capture_secrets
+  if profile_mode_active; then
+    log_info "syncthing engine, profile mode: $(enabled_profiles | tr '\n' ' ')"
+    profile_run_all capture
   else
-    log_info "diverged; rebasing"
-    if ! git rebase --autostash origin/"$DOTSYNC_DATA_BRANCH" --quiet; then
-      handle_conflict
-      exit 2
-    fi
+    capture_sessions
+    capture_dotfiles
   fi
-fi
+  prune_sessions
 
-# 3. Deploy the merged state to canonical paths.
-deploy_secrets
-if profile_mode_active; then
-  profile_run_all deploy
+  # 2. Nudge Syncthing — without this, replication waits for the next
+  #    filesystem-watch event (which fswatch covers, but rescan is cheap
+  #    and makes 'dotsync sync' synchronous-feeling).
+  st_rescan >/dev/null 2>&1 || true
+
+  # 3. Wait briefly for inbound changes to settle so deploy reads the
+  #    post-replication state. Best-effort; deploy works on whatever's
+  #    there if the wait times out.
+  st_wait_idle "$SYNCTHING_FOLDER_ID" 10 >/dev/null 2>&1 || true
+
+  # 4. Deploy.
+  deploy_secrets
+  if profile_mode_active; then
+    profile_run_all deploy
+  else
+    deploy_sessions
+    deploy_dotfiles
+  fi
 else
-  deploy_sessions
-  deploy_dotfiles
-fi
+  # ── Legacy git engine (v0.3) ────────────────────────────────────────
+  unlock_repo
 
-# 4. Push any local commits we made in step 1.
-if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/"$DOTSYNC_DATA_BRANCH")" ]]; then
-  if ! git push origin "$DOTSYNC_DATA_BRANCH" --quiet 2>/dev/null; then
-    log_warn "push rejected; fetching + rebasing"
-    git fetch origin "$DOTSYNC_DATA_BRANCH" --quiet
-    if ! git rebase --autostash origin/"$DOTSYNC_DATA_BRANCH" --quiet; then
-      handle_conflict
-      exit 2
-    fi
-    git push origin "$DOTSYNC_DATA_BRANCH" --quiet || die "push failed after rebase"
+  # 1. Capture local-machine state FIRST so any pending edits land in a
+  #    commit before we fetch/rebase. Avoids "unstaged changes" rebase
+  #    aborts when the working tree is dirty from a prior run.
+  capture_secrets
+  if profile_mode_active; then
+    log_info "git engine, profile mode: $(enabled_profiles | tr '\n' ' ')"
+    profile_run_all capture
+  else
+    migrate_session_layout
+    capture_sessions
+    capture_dotfiles
   fi
-  log_info "pushed local changes"
+  prune_sessions
+
+  if [[ -n "$(git status --porcelain)" ]]; then
+    git add -A
+    git commit -m "auto-sync $(hostname -s) $(date -u +%Y-%m-%dT%H:%M:%SZ)" --quiet \
+      || die "commit failed"
+  fi
+
+  # 2. Pull remote changes.
+  git fetch origin "$DOTSYNC_DATA_BRANCH" --quiet || die "git fetch failed"
+
+  local_sha="$(git rev-parse HEAD)"
+  remote_sha="$(git rev-parse origin/"$DOTSYNC_DATA_BRANCH")"
+
+  if [[ "$local_sha" != "$remote_sha" ]]; then
+    # Both branches handle a real race: a long-lived process (Claude
+    # Code, an editor) writes through a symlink into the working tree
+    # between step 1's commit and the merge/rebase's internal checkout.
+    # Without autostash, the operation aborts with "Your local changes
+    # to ... would be overwritten by checkout".
+    if git merge-base --is-ancestor "$local_sha" "$remote_sha"; then
+      log_info "fast-forward to $remote_sha"
+      git -c merge.autoStash=true merge --ff-only "$remote_sha" --quiet \
+        || die "ff merge failed"
+    else
+      log_info "diverged; rebasing"
+      if ! git rebase --autostash origin/"$DOTSYNC_DATA_BRANCH" --quiet; then
+        handle_conflict
+        exit 2
+      fi
+    fi
+  fi
+
+  # 3. Deploy the merged state to canonical paths.
+  deploy_secrets
+  if profile_mode_active; then
+    profile_run_all deploy
+  else
+    deploy_sessions
+    deploy_dotfiles
+  fi
+
+  # 4. Push any local commits we made in step 1.
+  if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/"$DOTSYNC_DATA_BRANCH")" ]]; then
+    if ! git push origin "$DOTSYNC_DATA_BRANCH" --quiet 2>/dev/null; then
+      log_warn "push rejected; fetching + rebasing"
+      git fetch origin "$DOTSYNC_DATA_BRANCH" --quiet
+      if ! git rebase --autostash origin/"$DOTSYNC_DATA_BRANCH" --quiet; then
+        handle_conflict
+        exit 2
+      fi
+      git push origin "$DOTSYNC_DATA_BRANCH" --quiet || die "push failed after rebase"
+    fi
+    log_info "pushed local changes"
+  fi
 fi
 
 date -u +%Y-%m-%dT%H:%M:%SZ > "$ENV_LASTSYNC_FILE"
