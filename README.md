@@ -93,6 +93,7 @@ Done. Both Syncthing daemons connect, the folder replicates, your CC content syn
 ```bash
 dotsync status         # one-line health
 dotsync ui             # opens dashboard at http://127.0.0.1:7878
+dotsync ui --install   # background daemon: dashboard always there at login
 dotsync ui --share     # public URL for any device (token-protected)
 dotsync doctor         # 25-check diagnostic
 ```
@@ -104,6 +105,17 @@ dotsync works the same whether your machines are on the same WiFi or scattered a
 - **`dotsync pair` / `dotsync join`** uses [magic-wormhole](https://magic-wormhole.readthedocs.io/) — the pairing code travels over the public wormhole relays, not your LAN.
 - **Sync** rides on Syncthing's defaults: global discovery so peers find each other anywhere by device ID; NAT traversal (UPnP + hole-punching) for direct connections; public TLS-encrypted relays as fallback when both peers are behind hostile NATs. Your data is end-to-end encrypted on all paths — relays see TLS bytes only.
 - **`dotsync doctor`** confirms global discovery / relays / NAT traversal are enabled. They're on by default.
+
+### Always-on dashboard
+
+By default `dotsync ui` runs in the foreground. To have it auto-start at login (and survive crashes via launchd `KeepAlive`):
+
+```bash
+dotsync ui --install     # writes ~/Library/LaunchAgents/dev.dotsync.ui.plist + launchctl load
+dotsync ui --uninstall   # tears it down
+```
+
+The agent runs `dotsync ui --background --no-open`, so the dashboard sits at `http://127.0.0.1:7878/` whenever you log in. Logs go to `~/Library/Logs/dotsync-ui.{out,err}.log`. The plist points at the `/opt/homebrew/bin/dotsync` symlink, so `brew upgrade dotsync` doesn't break the agent — the symlink re-points itself.
 
 ### Remote dashboard
 
@@ -175,6 +187,8 @@ Daily use
   doctor            Run 25 setup + connectivity checks with hints
   sync              Force a sync now (daemon does this every 60s)
   ui                Open status dashboard at http://127.0.0.1:7878
+  ui --install      Install launchd agent: dashboard auto-starts at login
+  ui --uninstall    Remove the launchd agent
   ui --share        Token-protected public URL via cloudflared quick tunnel
   pause / resume    Halt or restart the dotsync agent
 

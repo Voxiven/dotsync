@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+
+    <!-- The dispatcher symlink (e.g. /opt/homebrew/bin/dotsync) is
+         re-created by Homebrew on every upgrade, so we point at it
+         directly to survive 'brew upgrade dotsync' without a
+         re-install of this agent. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>__DOTSYNC_BIN__</string>
+        <string>ui</string>
+        <string>--background</string>
+        <string>--no-open</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- KeepAlive: restart the dashboard if it crashes or is killed.
+         Combined with ThrottleInterval to avoid a crash loop chewing
+         CPU; if the process exits faster than 10s, launchd waits for
+         the throttle window before respawning. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/dotsync-ui.out.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/dotsync-ui.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>DOTSYNC_CONFIG</key>
+        <string>__CONFIG__</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+</dict>
+</plist>

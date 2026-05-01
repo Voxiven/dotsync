@@ -269,6 +269,25 @@ else
   fi
 fi
 
+# UI daemon — optional, opt-in via `dotsync ui --install`. PASS or INFO,
+# never FAIL: dashboard not auto-running is a valid mode.
+UI_PLIST="$HOME/Library/LaunchAgents/dev.dotsync.ui.plist"
+if [[ -f "$UI_PLIST" ]]; then
+  if [[ -n "$(launchctl list 2>/dev/null | grep 'dev.dotsync.ui' || true)" ]]; then
+    if curl -fsS --max-time 1 http://127.0.0.1:7878/healthz >/dev/null 2>&1; then
+      check PASS "UI daemon" "loaded + responding at http://127.0.0.1:7878"
+    else
+      check WARN "UI daemon" "loaded but port 7878 not responding" \
+        "check ~/Library/Logs/dotsync-ui.err.log; 'launchctl kickstart -k gui/$(id -u)/dev.dotsync.ui'"
+    fi
+  else
+    check WARN "UI daemon" "plist present but not loaded" \
+      "launchctl load -w '$UI_PLIST'"
+  fi
+else
+  check PASS "UI daemon" "not installed (run 'dotsync ui --install' to auto-start in background)"
+fi
+
 if is_paused; then
   check FAIL "sync state" "PAUSED ($ENV_PAUSE_FLAG exists)" \
     "run 'dotsync resume'"

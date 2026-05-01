@@ -24,7 +24,7 @@ import urllib.parse
 import webbrowser
 from pathlib import Path
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 
 # Token for non-loopback access. Empty = auth disabled (loopback-only mode).
 # Populated by main() on startup; checked by Handler.
@@ -1062,6 +1062,105 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self._serve_json(200 if ok else 500, {"ok": ok, "message": msg})
 
 
+# ── Background launchd agent (used by --install / --uninstall) ────────
+
+
+UI_LABEL = "dev.dotsync.ui"
+
+
+def _ui_plist_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{UI_LABEL}.plist"
+
+
+def _stable_dotsync_path() -> str:
+    """Path to the dotsync dispatcher that survives 'brew upgrade'.
+
+    Prefer a PATH-discoverable 'dotsync' (Homebrew creates a stable
+    /opt/homebrew/bin/dotsync symlink that re-points at the new Cellar
+    after upgrade — so the plist keeps working). Fall back to a sibling
+    of this script for dev installs (running ./bin/dotsync-ui directly).
+    """
+    p = shutil.which("dotsync")
+    if p:
+        return p
+    return str(tool_dir() / "bin" / "dotsync")
+
+
+def install_ui_agent() -> int:
+    """Install + load the launchd agent that keeps the dashboard up.
+
+    Idempotent: re-running replaces the plist and reloads. Returns 0 on
+    success, non-zero on failure.
+    """
+    template = tool_dir() / "launchd" / "dev.dotsync.ui.plist.template"
+    if not template.exists():
+        print(
+            f"error: template missing at {template}\n"
+            "       (likely a corrupted install — try 'brew reinstall dotsync')",
+            file=sys.stderr,
+        )
+        return 1
+
+    cfg_path = os.environ.get(
+        "DOTSYNC_CONFIG", str(Path.home() / ".config" / "dotsync" / "config.sh")
+    )
+    bin_path = _stable_dotsync_path()
+
+    rendered = template.read_text()
+    rendered = rendered.replace("__LABEL__", UI_LABEL)
+    rendered = rendered.replace("__DOTSYNC_BIN__", bin_path)
+    rendered = rendered.replace("__HOME__", str(Path.home()))
+    rendered = rendered.replace("__CONFIG__", cfg_path)
+
+    plist = _ui_plist_path()
+    plist.parent.mkdir(parents=True, exist_ok=True)
+    plist.write_text(rendered)
+
+    # Validate before loading so a typo doesn't leave us with a broken plist.
+    lint = subprocess.run(
+        ["plutil", "-lint", str(plist)], capture_output=True, text=True
+    )
+    if lint.returncode != 0:
+        print(f"error: plist failed plutil -lint:\n{lint.stdout}{lint.stderr}",
+              file=sys.stderr)
+        return 1
+
+    # Unload any prior instance so changes take effect; ignore errors
+    # (likely not loaded yet on first install).
+    subprocess.run(
+        ["launchctl", "unload", str(plist)], capture_output=True
+    )
+    load = subprocess.run(
+        ["launchctl", "load", "-w", str(plist)], capture_output=True, text=True
+    )
+    if load.returncode != 0:
+        print(f"error: launchctl load failed:\n{load.stderr}", file=sys.stderr)
+        return 1
+
+    print(f"installed: {plist}")
+    print(f"  runs:    {bin_path} ui --background --no-open")
+    print(f"  visit:   http://127.0.0.1:7878/")
+    print(f"  logs:    ~/Library/Logs/dotsync-ui.{{out,err}}.log")
+    print()
+    print("Auto-starts at login and on crash. To stop:")
+    print(f"  dotsync ui --uninstall")
+    return 0
+
+
+def uninstall_ui_agent() -> int:
+    """Unload + remove the launchd agent. Idempotent."""
+    plist = _ui_plist_path()
+    if not plist.exists():
+        print("no UI agent installed.")
+        return 0
+    subprocess.run(
+        ["launchctl", "unload", str(plist)], capture_output=True
+    )
+    plist.unlink()
+    print(f"removed: {plist}")
+    return 0
+
+
 # ── Cloudflared quick tunnel (used by --share) ────────────────────────
 
 
@@ -1143,7 +1242,24 @@ def main() -> None:
         action="store_true",
         help="Expose dashboard via cloudflared quick tunnel (token-protected)",
     )
+    parser.add_argument(
+        "--install",
+        action="store_true",
+        help="Install launchd agent so the dashboard runs in the background",
+    )
+    parser.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="Remove the launchd agent",
+    )
     args = parser.parse_args()
+
+    # Install/uninstall short-circuit: don't start a server, just manage the
+    # launchd plist and exit.
+    if args.install:
+        sys.exit(install_ui_agent())
+    if args.uninstall:
+        sys.exit(uninstall_ui_agent())
 
     # Line-buffer stdout so users running with output redirected (launchd,
     # piped to a file) see "Public URL: ..." immediately when --share runs,

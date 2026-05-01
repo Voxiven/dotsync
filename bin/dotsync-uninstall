@@ -92,6 +92,15 @@ else
   note "no plist at $PLIST"
 fi
 
+# UI daemon (opt-in via 'dotsync ui --install') — separate plist, separate
+# label. Not service-scoped: only one UI daemon per machine.
+UI_PLIST="$HOME/Library/LaunchAgents/dev.dotsync.ui.plist"
+if [[ -f "$UI_PLIST" ]]; then
+  launchctl unload "$UI_PLIST" 2>/dev/null && say "unloaded UI daemon" \
+    || note "UI daemon was not loaded"
+  rm -f "$UI_PLIST" && say "removed UI plist"
+fi
+
 step "Per-machine state dir"
 if [[ -d "$DOTSYNC_STATE_DIR" ]]; then
   rm -rf "$DOTSYNC_STATE_DIR" && say "removed $DOTSYNC_STATE_DIR"
