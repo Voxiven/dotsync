@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# dotsync-uninstall — tear down a dotsync setup on this machine.
+#
+# Reads $DOTSYNC_CONFIG (or env-overridden values) to find what to remove.
+# Targets exactly one setup at a time, so you can have multiple dotsync
+# setups (e.g. work + personal, production + test) and uninstall them
+# independently by sourcing the right config first.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_common.sh"
+
+KEEP_DATA=false
+KEEP_KEYCHAIN=false
+KEEP_CONFIG=false
+FORCE=false
+
+usage() {
+  cat <<EOF
+dotsync uninstall — fully tear down a dotsync setup on this machine.
+
+Usage: dotsync uninstall [options]
+
+Options:
+  --keep-data        Don't delete \$DOTSYNC_DATA_DIR.
+  --keep-keychain    Don't delete the age identity from Keychain
+                     (use this if you plan to re-init or rejoin later
+                     and want to reuse the existing identity).
+  --keep-config      Don't delete \$DOTSYNC_CONFIG.
+  --force            Skip the confirmation prompt.
+
+What it removes (using values from \$DOTSYNC_CONFIG / env vars):
+  - launchd plist:    \$HOME/Library/LaunchAgents/\$DOTSYNC_KC_SERVICE.plist
+  - Keychain entry:   service=\$DOTSYNC_KC_SERVICE account=\$DOTSYNC_KC_ACCOUNT
+  - Data dir:         \$DOTSYNC_DATA_DIR
+  - Config file:      \$DOTSYNC_CONFIG
+  - Recovery file(s): ~/Documents/dotsync-recovery-*.txt that mention
+                      this Keychain service
+
+Does NOT touch:
+  - The remote git repo (use 'gh repo delete' if you want it gone too)
+  - ~/.claude/projects/*  (Claude Code session files)
+  - The dotsync tool itself
+
+To uninstall a specific setup when you have multiple:
+  DOTSYNC_CONFIG=~/.config/dotsync/config-test.sh dotsync uninstall
+
+  …or set DOTSYNC_DATA_DIR / DOTSYNC_KC_SERVICE inline if your config is gone.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --keep-data)     KEEP_DATA=true; shift ;;
+    --keep-keychain) KEEP_KEYCHAIN=true; shift ;;
+    --keep-config)   KEEP_CONFIG=true; shift ;;
+    --force)         FORCE=true; shift ;;
+    -h|--help)       usage; exit 0 ;;
+    *)               echo "unknown flag: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+LABEL="$DOTSYNC_KC_SERVICE"
+PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
+
+# Find recovery files that mention our Keychain service. We don't blanket-
+# delete dotsync-recovery-*.txt because the user may have multiple setups
+# and the files are unique per setup (they list "service: <name>" inside).
+find_recovery_files() {
+  local f
+  for f in "$HOME/Documents/dotsync-recovery-"*.txt; do
+    [[ -f "$f" ]] || continue
+    if grep -q "service: $DOTSYNC_KC_SERVICE" "$f" 2>/dev/null; then
+      echo "$f"
+    fi
+  done
+}
+
+step() { printf '\n→ %s\n' "$*"; }
+say()  { printf '  %s\n' "$*"; }
+note() { printf '    (%s)\n' "$*"; }
+
+# ── Plan ────────────────────────────────────────────────────────────
+cat <<EOF
+
+About to uninstall this dotsync setup:
+
+  Service:         $DOTSYNC_KC_SERVICE
+  Config:          $DOTSYNC_CONFIG $($KEEP_CONFIG && echo "(KEEPING)")
+  Data dir:        $DOTSYNC_DATA_DIR $($KEEP_DATA && echo "(KEEPING)")
+  Keychain entry:  $DOTSYNC_KC_SERVICE / $DOTSYNC_KC_ACCOUNT $($KEEP_KEYCHAIN && echo "(KEEPING)")
+  launchd plist:   $PLIST
+
+Recovery files matching this service:
+EOF
+recovery_files="$(find_recovery_files)"
+if [[ -n "$recovery_files" ]]; then
+  echo "$recovery_files" | sed 's/^/    /'
+else
+  echo "    (none found)"
+fi
+
+cat <<EOF
+
+This will NOT touch:
+  - The remote git repo (delete via 'gh repo delete' separately if needed)
+  - ~/.claude/projects/* — Claude Code's session/memory files
+  - Other dotsync setups on this machine (only the one above)
+
+EOF
+
+if ! $FORCE; then
+  read -rp "Proceed? Type 'yes' to confirm: " ans
+  [[ "$ans" == "yes" ]] || { echo "aborted"; exit 1; }
+fi
+
+# ── Execute ─────────────────────────────────────────────────────────
+step "launchd agent"
+if [[ -f "$PLIST" ]]; then
+  launchctl unload "$PLIST" 2>/dev/null && say "unloaded" || note "was not loaded"
+  rm -f "$PLIST" && say "removed plist"
+else
+  note "no plist at $PLIST"
+fi
+
+step "Keychain entry"
+if $KEEP_KEYCHAIN; then
+  note "keeping per --keep-keychain"
+elif security find-generic-password -s "$DOTSYNC_KC_SERVICE" -a "$DOTSYNC_KC_ACCOUNT" -w >/dev/null 2>&1; then
+  if security delete-generic-password -s "$DOTSYNC_KC_SERVICE" -a "$DOTSYNC_KC_ACCOUNT" >/dev/null 2>&1; then
+    say "removed entry for $DOTSYNC_KC_SERVICE / $DOTSYNC_KC_ACCOUNT"
+  else
+    say "deletion failed (try manually: security delete-generic-password -s $DOTSYNC_KC_SERVICE -a $DOTSYNC_KC_ACCOUNT)"
+  fi
+else
+  note "no entry for $DOTSYNC_KC_SERVICE / $DOTSYNC_KC_ACCOUNT"
+fi
+
+step "Data dir"
+if $KEEP_DATA; then
+  note "keeping per --keep-data"
+elif [[ -d "$DOTSYNC_DATA_DIR" ]]; then
+  if rm -rf "$DOTSYNC_DATA_DIR"; then
+    say "removed $DOTSYNC_DATA_DIR"
+  else
+    say "removal failed"
+  fi
+else
+  note "$DOTSYNC_DATA_DIR does not exist"
+fi
+
+step "Config file"
+if $KEEP_CONFIG; then
+  note "keeping per --keep-config"
+elif [[ -f "$DOTSYNC_CONFIG" ]]; then
+  rm -f "$DOTSYNC_CONFIG" && say "removed $DOTSYNC_CONFIG"
+else
+  note "$DOTSYNC_CONFIG does not exist"
+fi
+
+step "Recovery files"
+if [[ -n "$recovery_files" ]]; then
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    rm -f "$f" && say "removed $f"
+  done <<< "$recovery_files"
+else
+  note "none for this service"
+fi
+
+cat <<EOF
+
+✅ uninstall complete.
+
+Other dotsync setups (if any) on this machine are untouched.
+Reminder: the remote git repo at the upstream URL is still there.
+EOF

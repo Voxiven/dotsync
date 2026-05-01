@@ -66,7 +66,23 @@ ask()  {
 
 DOTSYNC_CONFIG="${DOTSYNC_CONFIG:-${HOME}/.config/dotsync/config.sh}"
 if [[ -f "$DOTSYNC_CONFIG" ]] && ! $FORCE; then
-  fail "dotsync already initialized at $DOTSYNC_CONFIG (use --force to overwrite)"
+  cat >&2 <<EOF
+✗ dotsync already initialized at $DOTSYNC_CONFIG.
+
+To set up a SECOND dotsync instance alongside the existing one:
+  DOTSYNC_CONFIG=~/.config/dotsync/config-other.sh \\
+  DOTSYNC_DATA_DIR=~/.dotsync-data-other \\
+  DOTSYNC_KC_SERVICE=other.dotsync.envsync \\
+    dotsync join --repo <url>
+
+To REPLACE the existing setup (destroys data and config):
+  dotsync uninstall    # ← much safer than --force
+  dotsync join --repo <url>
+
+Only use --force if you understand it'll rm -rf $DOTSYNC_DATA_DIR and
+overwrite $DOTSYNC_CONFIG.
+EOF
+  exit 1
 fi
 
 # ── 1. Preflight ────────────────────────────────────────────────────
@@ -116,8 +132,8 @@ output=$(wormhole receive "$CODE" 2>&1) \
 identity=$(printf '%s\n' "$output" | grep -E '^AGE-SECRET-KEY-' | head -1)
 [[ -n "$identity" ]] || fail "did not receive a valid age identity (output: $output)"
 
-KC_SERVICE="dev.dotsync.envsync"
-KC_ACCOUNT="default"
+KC_SERVICE="${DOTSYNC_KC_SERVICE:-dev.dotsync.envsync}"
+KC_ACCOUNT="${DOTSYNC_KC_ACCOUNT:-default}"
 security add-generic-password -s "$KC_SERVICE" -a "$KC_ACCOUNT" -U -w "$identity" \
   || fail "could not store identity in Keychain"
 say "identity stored in Keychain (service=$KC_SERVICE)"
