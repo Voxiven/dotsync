@@ -91,7 +91,7 @@ step "Data repo"
 [[ -n "$REPO_URL" ]] || REPO_URL="$(ask "Data repo URL" "")"
 [[ -n "$REPO_URL" ]] || fail "data repo URL required"
 
-DOTSYNC_DATA_DIR="${HOME}/.dotsync-data"
+DOTSYNC_DATA_DIR="${DOTSYNC_DATA_DIR:-${HOME}/.dotsync-data}"
 [[ -d "$DOTSYNC_DATA_DIR/.git" ]] && ! $FORCE \
   && fail "$DOTSYNC_DATA_DIR already exists; rm -rf it first"
 

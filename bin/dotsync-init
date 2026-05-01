@@ -104,7 +104,7 @@ fi
 # ── 3. Repo: create via gh or use --repo ────────────────────────────
 step "Repo setup"
 
-DOTSYNC_DATA_DIR="${HOME}/.dotsync-data"
+DOTSYNC_DATA_DIR="${DOTSYNC_DATA_DIR:-${HOME}/.dotsync-data}"
 
 if [[ -z "$REPO_URL" ]]; then
   # Need gh authenticated.
