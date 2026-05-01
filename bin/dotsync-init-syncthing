@@ -118,14 +118,23 @@ else
   say "already running"
 fi
 
-# Wait for the REST API to come up (config generation can take a few sec).
+# Wait for the REST API to come up. Syncthing v2+ requires the API key
+# even on /ping (returns 403 without it), so we accept any 3-digit
+# response — a 401/403 means the server is up and we'll authenticate
+# below. A 000 (curl couldn't connect) means try again.
+st_responding() {
+  local code
+  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 \
+    "$ST_API_BASE/rest/system/ping" 2>/dev/null || echo 000)
+  [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]
+}
+
 say "waiting for REST API at $ST_API_BASE …"
 for i in {1..30}; do
-  curl -fsS --max-time 2 "$ST_API_BASE/rest/system/ping" >/dev/null 2>&1 && break
+  st_responding && break
   sleep 1
 done
-curl -fsS --max-time 2 "$ST_API_BASE/rest/system/ping" >/dev/null 2>&1 \
-  || fail "Syncthing daemon did not respond after 30s"
+st_responding || fail "Syncthing daemon did not respond after 30s"
 say "ready"
 
 # Cache the API key (extracted from config.xml).

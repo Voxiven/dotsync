@@ -187,13 +187,19 @@ else
 fi
 
 ST_API_BASE="${SYNCTHING_API_BASE:-http://127.0.0.1:8384}"
+st_responding() {
+  local code
+  code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 2 \
+    "$ST_API_BASE/rest/system/ping" 2>/dev/null || echo 000)
+  [[ "$code" =~ ^[1-5][0-9][0-9]$ ]]
+}
+
 say "waiting for REST API…"
 for i in {1..30}; do
-  curl -fsS --max-time 2 "$ST_API_BASE/rest/system/ping" >/dev/null 2>&1 && break
+  st_responding && break
   sleep 1
 done
-curl -fsS --max-time 2 "$ST_API_BASE/rest/system/ping" >/dev/null 2>&1 \
-  || die "Syncthing daemon did not respond after 30s"
+st_responding || die "Syncthing daemon did not respond after 30s"
 say "ready"
 
 # Cache API key.
