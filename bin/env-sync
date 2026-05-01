@@ -139,12 +139,19 @@ local_sha="$(git rev-parse HEAD)"
 remote_sha="$(git rev-parse origin/"$DOTSYNC_DATA_BRANCH")"
 
 if [[ "$local_sha" != "$remote_sha" ]]; then
+  # Both branches handle a real race: a long-lived process (Claude Code, an
+  # editor) writes through a symlink into the working tree between step 1's
+  # commit and the merge/rebase's internal checkout. Without autostash,
+  # the operation aborts with "Your local changes to ... would be overwritten
+  # by checkout". `merge.autoStash` (git 2.27+) and `rebase --autostash` make
+  # the operation transparent to such concurrent writes.
   if git merge-base --is-ancestor "$local_sha" "$remote_sha"; then
     log_info "fast-forward to $remote_sha"
-    git merge --ff-only "$remote_sha" --quiet
+    git -c merge.autoStash=true merge --ff-only "$remote_sha" --quiet \
+      || die "ff merge failed"
   else
     log_info "diverged; rebasing"
-    if ! git rebase origin/"$DOTSYNC_DATA_BRANCH" --quiet; then
+    if ! git rebase --autostash origin/"$DOTSYNC_DATA_BRANCH" --quiet; then
       handle_conflict
       exit 2
     fi
@@ -160,7 +167,7 @@ if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/"$DOTSYNC_DATA_BRANCH")
   if ! git push origin "$DOTSYNC_DATA_BRANCH" --quiet 2>/dev/null; then
     log_warn "push rejected; fetching + rebasing"
     git fetch origin "$DOTSYNC_DATA_BRANCH" --quiet
-    if ! git rebase origin/"$DOTSYNC_DATA_BRANCH" --quiet; then
+    if ! git rebase --autostash origin/"$DOTSYNC_DATA_BRANCH" --quiet; then
       handle_conflict
       exit 2
     fi

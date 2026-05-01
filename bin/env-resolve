@@ -92,7 +92,7 @@ fi
 # commit), NOT the upstream — opposite of merge semantics.
 git fetch origin "$DOTSYNC_DATA_BRANCH" --quiet || die "git fetch failed after resolve"
 if ! git merge-base --is-ancestor HEAD origin/"$DOTSYNC_DATA_BRANCH" 2>/dev/null; then
-  if ! git rebase origin/"$DOTSYNC_DATA_BRANCH" -X theirs --quiet 2>/dev/null; then
+  if ! git rebase --autostash origin/"$DOTSYNC_DATA_BRANCH" -X theirs --quiet 2>/dev/null; then
     # If even -X theirs fails, surface the error clearly.
     git rebase --abort 2>/dev/null || true
     die "rebase after resolve failed — manual intervention needed"
