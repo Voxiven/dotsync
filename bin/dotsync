@@ -22,6 +22,7 @@ Setup (run once per machine):
 
 Daily use:
   status              One-line summary of sync state
+  doctor              Diagnose common setup issues with remediation hints
   sync                Force a sync now (daemon does this every 60s)
   ui                  Open status dashboard at http://127.0.0.1:7878
   pause / resume      Halt or restart the sync daemon

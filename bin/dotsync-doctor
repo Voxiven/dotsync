@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+# dotsync-doctor — self-service diagnostic.
+#
+# Walks through the configuration + runtime checks that, in the author's
+# experience, cover ~90% of "dotsync just isn't working" cases. Each
+# check returns one of:
+#   ✓  passing
+#   ⚠  warning (not blocking, but worth fixing)
+#   ✗  failing (sync probably broken)
+#
+# Each failing/warning check prints a remediation hint.
+#
+# Exit code: 0 if all checks pass, 1 if any warnings, 2 if any failures.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOL_DIR="$(dirname "$SCRIPT_DIR")"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_common.sh"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_syncthing.sh"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<EOF
+dotsync doctor — diagnostic check on this machine's setup.
+
+Usage: dotsync doctor [--json]
+
+Walks through the most-common failure modes:
+  - Required commands installed
+  - Config file present and parseable
+  - Syncthing daemon running, REST API reachable
+  - Folder configured + at least one peer connected
+  - Profile-defined symlinks correctly wired
+  - Per-machine state in the right place
+  - Conflict files present
+  - Daemon (launchd) loaded
+
+Exit codes:
+  0  all good
+  1  warnings only (sync still works, but check them)
+  2  failures (sync probably broken)
+
+--json prints structured output instead of human-readable.
+EOF
+  exit 0
+fi
+
+JSON=false
+[[ "${1:-}" == "--json" ]] && JSON=true
+
+# ── Output helpers ───────────────────────────────────────────────────
+PASS=0
+WARN=0
+FAIL=0
+REPORT=()  # for --json: tuples of "level\tcheck\tmessage\thint"
+
+check() {
+  local level="$1" name="$2" msg="$3" hint="${4:-}"
+  case "$level" in
+    PASS) PASS=$((PASS+1)); $JSON || printf '  ✓ %-32s %s\n' "$name" "$msg" ;;
+    WARN) WARN=$((WARN+1));
+          if $JSON; then :; else
+            printf '  ⚠ %-32s %s\n' "$name" "$msg"
+            [[ -n "$hint" ]] && printf '      hint: %s\n' "$hint"
+          fi ;;
+    FAIL) FAIL=$((FAIL+1));
+          if $JSON; then :; else
+            printf '  ✗ %-32s %s\n' "$name" "$msg"
+            [[ -n "$hint" ]] && printf '      hint: %s\n' "$hint"
+          fi ;;
+  esac
+  REPORT+=("$(printf '%s\t%s\t%s\t%s' "$level" "$name" "$msg" "${hint//$'\n'/ }")")
+}
+
+section() {
+  $JSON && return
+  printf '\n%s\n' "$1"
+}
+
+# ── 1. Required commands ─────────────────────────────────────────────
+section "Required commands"
+for cmd in syncthing jq fswatch wormhole curl rsync; do
+  if command -v "$cmd" >/dev/null 2>&1; then
+    check PASS "$cmd" "found at $(command -v "$cmd")"
+  else
+    check FAIL "$cmd" "not installed" "brew install $cmd"
+  fi
+done
+
+# ── 2. Config ────────────────────────────────────────────────────────
+section "Configuration"
+if [[ -f "$DOTSYNC_CONFIG" ]]; then
+  check PASS "config" "$DOTSYNC_CONFIG"
+else
+  check FAIL "config" "missing: $DOTSYNC_CONFIG" "run 'dotsync init' to create it"
+fi
+
+if [[ -d "$DOTSYNC_DATA_DIR" ]]; then
+  size=$(du -sh "$DOTSYNC_DATA_DIR" 2>/dev/null | cut -f1)
+  check PASS "data dir" "$DOTSYNC_DATA_DIR ($size)"
+else
+  check FAIL "data dir" "missing: $DOTSYNC_DATA_DIR" "run 'dotsync init'"
+fi
+
+if [[ -d "$DOTSYNC_STATE_DIR" ]]; then
+  check PASS "state dir" "$DOTSYNC_STATE_DIR"
+else
+  check WARN "state dir" "missing: $DOTSYNC_STATE_DIR" "will be created on next sync; check permissions on \$HOME"
+fi
+
+# State files MUST NOT live inside the data dir (would conflict-loop).
+for legacy in "$DOTSYNC_DATA_DIR/.last-sync" "$DOTSYNC_DATA_DIR/.sync-paused" "$DOTSYNC_DATA_DIR/.sync.lock"; do
+  if [[ -e "$legacy" ]]; then
+    check FAIL "state in data dir" "$legacy exists inside the synced folder" \
+      "this causes Syncthing conflict-loops. Remove it: rm -rf '$legacy'"
+  fi
+done
+
+# ── 3. Syncthing ─────────────────────────────────────────────────────
+section "Syncthing"
+
+if ! brew services list 2>/dev/null | grep -q "^syncthing.*started"; then
+  check FAIL "syncthing service" "not started via brew services" "brew services start syncthing"
+else
+  check PASS "syncthing service" "running"
+fi
+
+if st_running; then
+  check PASS "syncthing API" "reachable at $SYNCTHING_API_BASE"
+else
+  check FAIL "syncthing API" "not reachable at $SYNCTHING_API_BASE" \
+    "is Syncthing running? 'brew services restart syncthing'"
+fi
+
+# Only do API-dependent checks if we have a key.
+api_key="$(_st_api_key 2>/dev/null || true)"
+if [[ -z "$api_key" ]]; then
+  check WARN "syncthing API key" "not cached" \
+    "run any 'dotsync' command after Syncthing starts to populate the cache"
+else
+  check PASS "syncthing API key" "cached"
+
+  folder_id="${SYNCTHING_FOLDER_ID:-dotsync-data}"
+  # Folder configured? (st_curl wraps the API call with auth + quoting.)
+  if folder_resp=$(_st_curl GET "/rest/config/folders/$folder_id" 2>/dev/null) && [[ -n "$folder_resp" && "$folder_resp" != "null" ]]; then
+    folder_state=$(_st_curl GET "/rest/db/status?folder=$folder_id" 2>/dev/null \
+      | jq -r '.state // "unknown"' 2>/dev/null || echo unknown)
+    case "$folder_state" in
+      idle)             check PASS "folder $folder_id" "idle" ;;
+      scanning|syncing) check PASS "folder $folder_id" "$folder_state (in progress)" ;;
+      error)            check FAIL "folder $folder_id" "error state" "open $SYNCTHING_API_BASE for details" ;;
+      *)                check WARN "folder $folder_id" "state=$folder_state" ;;
+    esac
+  else
+    check FAIL "folder $folder_id" "not configured in Syncthing" \
+      "run 'dotsync init' or 'dotsync setup-symlinks'"
+  fi
+
+  # Peer connections.
+  if conn_resp=$(_st_curl GET "/rest/system/connections" 2>/dev/null) && [[ -n "$conn_resp" ]]; then
+    connected_count=$(echo "$conn_resp" | jq '[.connections | to_entries[] | select(.value.connected == true)] | length' 2>/dev/null || echo 0)
+    if [[ "$connected_count" -gt 0 ]]; then
+      check PASS "peers" "$connected_count connected"
+    else
+      check WARN "peers" "no peers connected" \
+        "did you run 'dotsync pair' / 'dotsync join'? second machine may be offline"
+    fi
+  fi
+fi
+
+# .stignore present?
+if [[ -f "$DOTSYNC_DATA_DIR/.stignore" ]]; then
+  check PASS ".stignore" "present (filters out per-machine state)"
+else
+  check WARN ".stignore" "missing in $DOTSYNC_DATA_DIR" \
+    "run 'dotsync setup-symlinks' to write it"
+fi
+
+# ── 4. Profile + symlinks ────────────────────────────────────────────
+section "Profiles + symlinks"
+
+ENABLED_FILE="$DOTSYNC_DATA_DIR/registry/enabled-profiles.json"
+if [[ -f "$ENABLED_FILE" ]]; then
+  enabled_list=$(jq -r '.profiles[]?' "$ENABLED_FILE" 2>/dev/null | tr '\n' ' ')
+  if [[ -z "$enabled_list" ]]; then
+    check WARN "enabled profiles" "none" "run 'dotsync enable claude-code'"
+  else
+    check PASS "enabled profiles" "$enabled_list"
+  fi
+else
+  check WARN "enabled profiles" "no enabled-profiles.json" "run 'dotsync init' or 'dotsync enable <name>'"
+fi
+
+# Spot-check the canonical claude-code symlinks.
+for path in "$HOME/.claude/settings.json" "$HOME/.claude/CLAUDE.md" "$HOME/.claude/agents" "$HOME/.claude/commands"; do
+  name="$(basename "$path")"
+  if [[ -L "$path" ]]; then
+    target="$(readlink "$path")"
+    if [[ "$target" == "$DOTSYNC_DATA_DIR"/* ]]; then
+      check PASS "symlink ${name}" "→ ${target/$HOME/~}"
+    else
+      check WARN "symlink ${name}" "points outside dotsync: $target" \
+        "rm '$path' and re-run 'dotsync setup-symlinks'"
+    fi
+  elif [[ -e "$path" ]]; then
+    check WARN "symlink ${name}" "exists as a regular file/dir, not a symlink" \
+      "run 'dotsync setup-symlinks' to migrate"
+  else
+    check WARN "symlink ${name}" "absent" \
+      "if you use this CC feature, run 'dotsync setup-symlinks'"
+  fi
+done
+
+# ── 5. Daemon ────────────────────────────────────────────────────────
+section "Launchd daemon"
+
+PLIST="$HOME/Library/LaunchAgents/$DOTSYNC_KC_SERVICE.plist"
+if [[ ! -f "$PLIST" ]]; then
+  check WARN "plist" "absent at $PLIST" \
+    "either re-run 'dotsync init' or 'dotsync no-daemon' is by design (sessions won't sync)"
+else
+  if [[ -n "$(launchctl list 2>/dev/null | grep "$DOTSYNC_KC_SERVICE" || true)" ]]; then
+    check PASS "plist" "loaded"
+  else
+    check WARN "plist" "exists but not loaded" "launchctl load -w '$PLIST'"
+  fi
+fi
+
+if is_paused; then
+  check FAIL "sync state" "PAUSED ($ENV_PAUSE_FLAG exists)" \
+    "run 'dotsync resume'"
+else
+  check PASS "sync state" "active"
+fi
+
+# Last sync recency.
+if [[ -f "$ENV_LASTSYNC_FILE" ]]; then
+  last_sync_str="$(cat "$ENV_LASTSYNC_FILE" 2>/dev/null)"
+  if [[ -n "$last_sync_str" ]]; then
+    # Parse ISO timestamp on macOS (limited date(1)).
+    last_sync_epoch=$(python3 -c "
+import datetime, sys
+try:
+    t = datetime.datetime.fromisoformat('${last_sync_str%Z}+00:00')
+    print(int(t.timestamp()))
+except Exception:
+    print(0)
+" 2>/dev/null || echo 0)
+    now_epoch=$(date +%s)
+    age_s=$((now_epoch - last_sync_epoch))
+    if [[ "$age_s" -lt 180 ]]; then
+      check PASS "last sync" "${age_s}s ago"
+    elif [[ "$age_s" -lt 600 ]]; then
+      check WARN "last sync" "${age_s}s ago (>3 min)" "daemon may be stalled; check 'dotsync logs'"
+    else
+      check FAIL "last sync" "${age_s}s ago (>10 min)" \
+        "the daemon hasn't completed a sync recently — check 'dotsync logs'"
+    fi
+  fi
+else
+  check WARN "last sync" "never" "the daemon hasn't run yet; try 'dotsync sync'"
+fi
+
+# ── 6. Conflict files ────────────────────────────────────────────────
+section "Conflicts"
+
+if [[ -d "$DOTSYNC_DATA_DIR" ]]; then
+  conflict_count=$(find "$DOTSYNC_DATA_DIR" -name '*.sync-conflict-*' -type f 2>/dev/null | wc -l | tr -d ' ')
+  if [[ "$conflict_count" -eq 0 ]]; then
+    check PASS "sync-conflict files" "none"
+  else
+    check WARN "sync-conflict files" "$conflict_count present" \
+      "review with 'dotsync clean-conflicts' (dry run); resolve user-content conflicts manually"
+  fi
+fi
+
+# ── Output ───────────────────────────────────────────────────────────
+exit_code=0
+[[ "$WARN" -gt 0 ]] && exit_code=1
+[[ "$FAIL" -gt 0 ]] && exit_code=2
+
+if $JSON; then
+  printf '{\n  "summary": {"pass": %d, "warn": %d, "fail": %d},\n  "checks": [\n' "$PASS" "$WARN" "$FAIL"
+  first=true
+  for line in "${REPORT[@]}"; do
+    IFS=$'\t' read -r level name msg hint <<< "$line"
+    $first || printf ',\n'
+    printf '    {"level": "%s", "name": "%s", "message": "%s", "hint": "%s"}' \
+      "$level" "${name//\"/\\\"}" "${msg//\"/\\\"}" "${hint//\"/\\\"}"
+    first=false
+  done
+  printf '\n  ]\n}\n'
+else
+  printf '\nSummary: ✓ %d  ⚠ %d  ✗ %d\n' "$PASS" "$WARN" "$FAIL"
+  case "$exit_code" in
+    0) printf '\nAll good. Sync should be working.\n' ;;
+    1) printf '\nWarnings only — sync should still be working, but the items above are worth a look.\n' ;;
+    2) printf '\nOne or more failures detected — sync is probably broken. Address ✗ items above.\n' ;;
+  esac
+fi
+
+exit $exit_code
