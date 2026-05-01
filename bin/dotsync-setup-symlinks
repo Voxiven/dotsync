@@ -86,4 +86,10 @@ else
   profile_run_all deploy
 fi
 
+# Refresh .stignore — keeps per-machine state and subagents/ out of
+# replication. Idempotent.
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_syncthing.sh"
+st_write_stignore
+
 echo "✓ symlinks wired"

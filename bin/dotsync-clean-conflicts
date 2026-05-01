@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# dotsync-clean-conflicts — remove Syncthing's *.sync-conflict-* files.
+#
+# Syncthing creates these when both peers edit the same file. dotsync's
+# .stignore should prevent them on per-machine state files going forward,
+# but historical ones (and conflicts on real user content) need explicit
+# cleanup.
+#
+# Default: dry-run (lists what would be deleted). Pass --apply to actually
+# remove. Pass --keep <kind> to preserve specific kinds.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_common.sh"
+
+APPLY=false
+KEEP_USER_CONTENT=true   # always default: don't auto-delete user-content conflicts
+
+usage() {
+  cat <<EOF
+dotsync clean-conflicts — remove Syncthing's .sync-conflict-* files.
+
+Usage: dotsync clean-conflicts [--apply] [--all]
+
+Options:
+  --apply   Actually delete the files. Without this, lists what would
+            go (dry run).
+  --all     Also remove conflicts on user content (settings.json,
+            CLAUDE.md, sessions, etc.). By default, only conflicts on
+            dotsync-internal state files (.last-sync, .sync-paused) are
+            removed — those are nonsense conflicts (per-machine state
+            that should never have been replicated).
+
+What it does:
+  Scans \$DOTSYNC_DATA_DIR for *.sync-conflict-* files. Categorizes
+  each as either:
+    - INTERNAL — dotsync state file (always safe to delete)
+    - USER     — real user content; deletion loses one peer's version,
+                 only delete with --all and only after deciding which
+                 side to keep
+
+Recommended workflow for user-content conflicts: review them in
+\$DOTSYNC_DATA_DIR, decide which version to keep (sometimes the
+sync-conflict file IS what you want; rename it back over the original).
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --apply)   APPLY=true; shift ;;
+    --all)     KEEP_USER_CONTENT=false; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *)         die "unknown flag: $1" ;;
+  esac
+done
+
+[[ -d "$DOTSYNC_DATA_DIR" ]] || die "no data dir at $DOTSYNC_DATA_DIR"
+
+# Match file basenames that came from per-machine state files.
+is_internal() {
+  local name="$1"
+  case "$name" in
+    *.sync-conflict-*-*.last-sync)    return 0 ;;
+    *.sync-conflict-*-*.sync-paused)  return 0 ;;
+    *.sync-conflict-*-*.sync.lock*)   return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+internal_count=0
+user_count=0
+internal_files=()
+user_files=()
+
+while IFS= read -r f; do
+  [[ -z "$f" ]] && continue
+  if is_internal "$(basename "$f")"; then
+    internal_files+=("$f")
+    internal_count=$((internal_count + 1))
+  else
+    user_files+=("$f")
+    user_count=$((user_count + 1))
+  fi
+done < <(find "$DOTSYNC_DATA_DIR" -name '*.sync-conflict-*' -type f 2>/dev/null)
+
+echo "Found:"
+echo "  $internal_count internal (per-machine state — safe to delete)"
+echo "  $user_count user content"
+
+if $APPLY; then
+  for f in "${internal_files[@]+"${internal_files[@]}"}"; do
+    rm -f "$f" && echo "  removed (internal): $f"
+  done
+  if ! $KEEP_USER_CONTENT; then
+    for f in "${user_files[@]+"${user_files[@]}"}"; do
+      rm -f "$f" && echo "  removed (USER): $f"
+    done
+  elif [[ $user_count -gt 0 ]]; then
+    echo
+    echo "Skipped $user_count user-content conflict(s). Inspect and resolve manually:"
+    for f in "${user_files[@]+"${user_files[@]}"}"; do echo "  $f"; done
+    echo
+    echo "Once you've decided what to keep on each, re-run with --all to drop the leftovers."
+  fi
+else
+  echo
+  echo "(dry run — pass --apply to actually delete)"
+  if [[ $internal_count -gt 0 ]]; then
+    echo
+    echo "Internal:"
+    for f in "${internal_files[@]+"${internal_files[@]}"}"; do echo "  $f"; done
+  fi
+  if [[ $user_count -gt 0 ]]; then
+    echo
+    echo "User content (use --all to also remove these):"
+    for f in "${user_files[@]+"${user_files[@]}"}"; do echo "  $f"; done
+  fi
+fi

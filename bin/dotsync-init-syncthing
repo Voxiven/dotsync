@@ -175,6 +175,11 @@ SYNCTHING_FOLDER_ID="${SYNCTHING_FOLDER_ID:-dotsync-data}"
 
 mkdir -p "$DOTSYNC_DATA_DIR"
 
+# Write .stignore — keeps per-machine state out of replication
+# (defense in depth; state files should also live outside the folder).
+ENV_REPO_ROOT="$DOTSYNC_DATA_DIR" SYNCTHING_API_BASE="$ST_API_BASE" \
+  bash -c 'source "'"$SCRIPT_DIR"'/_common.sh"; source "'"$SCRIPT_DIR"'/_syncthing.sh"; st_write_stignore'
+
 # Add (or update — Syncthing's PUT is upsert-ish) the folder. The folder
 # starts shared only with ourselves; peers get added later via dotsync pair.
 folder_payload=$(jq -n \

@@ -160,12 +160,14 @@ handle_conflict() {
 # --- main ---
 # Prevent concurrent runs (daemon vs manual). flock isn't on macOS by default,
 # so we use a mkdir-based lock that works everywhere.
-LOCK_DIR="${ENV_REPO_ROOT}/.sync.lock"
-if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+# Lock dir lives in $DOTSYNC_STATE_DIR (per-machine) — NOT in
+# $DOTSYNC_DATA_DIR, which would replicate the lock and cause peer
+# conflicts. ENV_LOCK_DIR is set in _common.sh.
+if ! mkdir "$ENV_LOCK_DIR" 2>/dev/null; then
   log_info "another env-sync is running; exiting cleanly"
   exit 0
 fi
-trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+trap 'rmdir "$ENV_LOCK_DIR" 2>/dev/null' EXIT
 
 if is_paused; then
   log_warn "sync paused (.sync-paused exists); run env-resolve"

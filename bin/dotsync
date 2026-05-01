@@ -41,7 +41,8 @@ Tracked items:
   list                Show everything tracked, by profile
 
 Conflicts & logs:
-  resolve             Interactive conflict resolution
+  resolve             Interactive conflict resolution (git engine)
+  clean-conflicts     Remove Syncthing .sync-conflict-* files (syncthing engine)
   logs [--tail]       Show sync log
 
 Help:

@@ -130,3 +130,38 @@ st_summary() {
 st_list_conflicts() {
   find "$ENV_REPO_ROOT" -name '*.sync-conflict-*' -type f 2>/dev/null
 }
+
+# Write/update the .stignore in the data dir. Idempotent. .stignore is a
+# per-machine file (not replicated by Syncthing — that's the whole point);
+# we maintain it identically on every machine.
+#
+# Patterns: per-machine dotsync state files (safety net — they should
+# already live in $DOTSYNC_STATE_DIR after Phase 4.8, but if anything
+# leaks through, ignore it). Plus subagents/ which CC writes per-machine
+# (irrelevant local subprocess state).
+st_write_stignore() {
+  [[ -d "$ENV_REPO_ROOT" ]] || return 0
+  local f="$ENV_REPO_ROOT/.stignore"
+  cat > "$f" <<'EOF'
+// dotsync — written by 'dotsync init' / 'setup-symlinks'. Edit at your
+// own risk; entries below prevent Syncthing from creating spurious
+// conflict files on machine-local state.
+
+// Per-machine dotsync state (should already live in ~/.dotsync-state/,
+// but ignore here defensively in case something writes them in-folder).
+.last-sync
+.sync-paused
+.sync.lock
+
+// Conflict files Syncthing creates when both peers edit. Match all
+// variants: .sync-conflict-DATE-TIME-DEVICEID.<ext>
+*.sync-conflict-*
+
+// CC subagents — per-machine subprocess scratch state, not user data.
+**/subagents/**
+
+// Editor / OS cruft we don't want on peers.
+.DS_Store
+**/.DS_Store
+EOF
+}
