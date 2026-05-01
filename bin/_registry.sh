@@ -34,6 +34,30 @@ project_names() {
   fi
 }
 
+# Emit "<portable_name>\t<local_encoded>" pairs, one per line.
+# portable_name is what we use as the in-repo storage path (e.g.
+# sessions/Omphalis/) — same on every machine. local_encoded is the
+# Claude Code per-machine path (e.g. -Users-foo-Workspace-Omphalis).
+project_pairs() {
+  local proot="${DOTSYNC_PROJECT_ROOT:-$HOME}"
+  local version
+  version="$(jq -r '.version // 1' "$PROJECTS_REGISTRY")"
+  if [[ "$version" -ge 2 ]]; then
+    jq -r '.projects[].name' "$PROJECTS_REGISTRY" | while read -r name; do
+      local encoded
+      encoded="$(echo "${proot}/${name}" | tr '/' '-')"
+      printf '%s\t%s\n' "$name" "$encoded"
+    done
+  else
+    # v1: no portable name; fall back to encoded for both fields. This means
+    # cross-machine session sync only works on v1 if both machines use the
+    # same DOTSYNC_PROJECT_ROOT — which is the schema's pre-existing limit.
+    jq -r '.projects[].encoded' "$PROJECTS_REGISTRY" | while read -r e; do
+      printf '%s\t%s\n' "$e" "$e"
+    done
+  fi
+}
+
 # Add a secret idempotently (silent skip if repo_path already present).
 registry_add_secret() {
   local repo_p="$1" real_p="$2"

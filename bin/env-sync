@@ -48,28 +48,29 @@ deploy_dotfiles() {
 }
 
 deploy_sessions() {
-  local proj
-  while read -r proj; do
-    local src="$ENV_REPO_ROOT/sessions/$proj"
-    local dst="$HOME/.claude/projects/$proj"
+  local name encoded
+  while IFS=$'\t' read -r name encoded; do
+    local src="$ENV_REPO_ROOT/sessions/$name"
+    local dst="$HOME/.claude/projects/$encoded"
     [[ -d "$src" ]] || continue
     mkdir -p "$dst"
     rsync -a --checksum --include='*.jsonl' --exclude='*' "$src/" "$dst/"
-  done < <(project_names)
+  done < <(project_pairs)
 }
 
 capture_sessions() {
   # Honor DOTSYNC_SESSION_MAX_MB (default 50) — skip files above this size to
   # avoid GitHub's 100MB hard limit and the slowness of pushing huge encrypted
-  # blobs that don't pack-delta. Honor DOTSYNC_SKIP_PROJECTS (space-separated
-  # encoded names) to skip whole projects (e.g. zombie projects).
+  # blobs that don't pack-delta. Honor DOTSYNC_SKIP_PROJECTS (space-separated;
+  # accepts portable names "Echolive" or per-machine encoded names like
+  # "-Users-foo-Workspace-Echolive" for backward compatibility).
   local max_mb="${DOTSYNC_SESSION_MAX_MB:-50}"
   local skip="${DOTSYNC_SKIP_PROJECTS:-}"
-  local proj
-  while read -r proj; do
-    [[ " $skip " == *" $proj "* ]] && continue
-    local src="$HOME/.claude/projects/$proj"
-    local dst="$ENV_REPO_ROOT/sessions/$proj"
+  local name encoded
+  while IFS=$'\t' read -r name encoded; do
+    [[ " $skip " == *" $name "* || " $skip " == *" $encoded "* ]] && continue
+    local src="$HOME/.claude/projects/$encoded"
+    local dst="$ENV_REPO_ROOT/sessions/$name"
     [[ -d "$src" ]] || continue
     mkdir -p "$dst"
     # Only top-level *.jsonl, not nested subagents/. Filter by size.
@@ -77,7 +78,29 @@ capture_sessions() {
       | while read -r jf; do
           rsync -a --checksum "$jf" "$dst/$(basename "$jf")"
         done
-  done < <(project_names)
+  done < <(project_pairs)
+}
+
+# One-time migration: rename per-machine encoded session dirs in the repo
+# to portable names. Pre-portability the storage layout was
+# sessions/-Users-foo-Workspace-Omphalis/ — keyed by Claude Code's
+# per-machine path. That meant Mac A and Mac B's sessions for the same
+# project lived in different repo dirs and never cross-synced. After
+# migration: sessions/Omphalis/, same on every machine. Merges if the
+# portable dir already exists (another machine migrated first).
+migrate_session_layout() {
+  [[ -d "$ENV_REPO_ROOT/sessions" ]] || return 0
+  local name encoded
+  while IFS=$'\t' read -r name encoded; do
+    [[ "$name" == "$encoded" ]] && continue   # v1 schema, no migration needed
+    local old="$ENV_REPO_ROOT/sessions/$encoded"
+    local new="$ENV_REPO_ROOT/sessions/$name"
+    [[ -d "$old" ]] || continue
+    log_info "migrating sessions: $encoded → $name"
+    mkdir -p "$new"
+    rsync -a "$old/" "$new/"
+    rm -rf "$old"
+  done < <(project_pairs)
 }
 
 # Remove any session files in the repo that exceed the size limit OR belong to
@@ -88,9 +111,16 @@ prune_sessions() {
   if [[ -d "$ENV_REPO_ROOT/sessions" ]]; then
     find "$ENV_REPO_ROOT/sessions" -name '*.jsonl' -size "+${max_mb}M" -delete 2>/dev/null || true
     find "$ENV_REPO_ROOT/sessions" -type d -name 'subagents' -exec rm -rf {} + 2>/dev/null || true
-    for s in $skip; do
-      rm -rf "$ENV_REPO_ROOT/sessions/$s" 2>/dev/null || true
-    done
+    # Skip-list entries can be portable names or legacy encoded names.
+    # Resolve to portable names via project_pairs and remove from the repo.
+    local name encoded
+    while IFS=$'\t' read -r name encoded; do
+      if [[ " $skip " == *" $name "* || " $skip " == *" $encoded "* ]]; then
+        rm -rf "$ENV_REPO_ROOT/sessions/$name" 2>/dev/null || true
+        # Also remove the legacy encoded dir if it survived migration.
+        [[ "$name" != "$encoded" ]] && rm -rf "$ENV_REPO_ROOT/sessions/$encoded" 2>/dev/null || true
+      fi
+    done < <(project_pairs)
   fi
 }
 
@@ -146,6 +176,7 @@ cd "$ENV_REPO_ROOT" || die "cannot cd to $ENV_REPO_ROOT"
 # 1. Capture local-machine state FIRST so any pending edits land in a commit
 #    before we fetch/rebase. Avoids "unstaged changes" rebase aborts when the
 #    working tree is dirty from a prior run or external edit.
+migrate_session_layout
 capture_secrets
 capture_sessions
 capture_dotfiles
