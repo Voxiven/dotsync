@@ -234,6 +234,117 @@ def scan_conflicts(data_dir: Path) -> list[dict]:
     return out
 
 
+# ── Per-session sync status ──────────────────────────────────────────
+#
+# Active CC sessions stay local on the writing machine until idle (5 min
+# default per DOTSYNC_SESSION_IDLE_THRESHOLD), so the peer sees stale
+# content for in-progress sessions. This view surfaces that lag — for
+# each session JSONL, compares the local file mtime against the data dir
+# copy's mtime and reports synced / pending / inbound. Force Sync (in
+# the UI) bypasses the idle gate for one cycle when the user wants
+# immediate propagation.
+
+
+def gather_sync_status(cfg: dict) -> dict:
+    data_dir = Path(cfg["DOTSYNC_DATA_DIR"])
+    home = Path.home()
+    sessions_root = data_dir / "claude-code" / "sessions"
+    cc_projects = home / ".claude" / "projects"
+
+    items: list[dict] = []
+    seen: set[str] = set()  # session basename ID
+
+    # The mapping is: <data_dir>/claude-code/sessions/<project>/<id>.jsonl
+    #              ↔ ~/.claude/projects/<encoded-of-project-path>/<id>.jsonl
+    # We don't need to know the encoding to compare — basenames (UUIDs)
+    # are unique. Walk both trees at the depth the session_jsonls profile
+    # actually captures (depth-1 from each project dir, no recursion into
+    # subagents/ etc.) and match by basename.
+    repo_files: dict[str, Path] = {}
+    if sessions_root.exists():
+        for p in sessions_root.glob("*/*.jsonl"):
+            if "sync-conflict" in p.name:
+                continue
+            repo_files[p.name] = p
+
+    local_files: dict[str, Path] = {}
+    if cc_projects.exists():
+        for p in cc_projects.glob("*/*.jsonl"):
+            if "sync-conflict" in p.name or "/subagents/" in str(p):
+                continue
+            local_files[p.name] = p
+
+    now = dt.datetime.now().timestamp()
+    idle_threshold = int(os.environ.get("DOTSYNC_SESSION_IDLE_THRESHOLD", "300"))
+
+    for basename in sorted(set(repo_files) | set(local_files)):
+        seen.add(basename)
+        local_p = local_files.get(basename)
+        repo_p = repo_files.get(basename)
+        local_mt = local_p.stat().st_mtime if local_p else 0
+        repo_mt = repo_p.stat().st_mtime if repo_p else 0
+        size = (local_p.stat().st_size if local_p else
+                (repo_p.stat().st_size if repo_p else 0))
+
+        if local_p and not repo_p:
+            status = "untracked"  # local exists but never synced (new session)
+        elif repo_p and not local_p:
+            status = "inbound"  # peer-only; deploy will pull it
+        elif abs(local_mt - repo_mt) <= 1:  # within fs granularity
+            status = "synced"
+        elif local_mt > repo_mt:
+            # Local has unsynced changes. Idle gate may be holding it back.
+            status = "pending" if (now - local_mt) < idle_threshold else "stale"
+        else:
+            status = "deploy-pending"  # data dir is newer than local
+
+        # Friendly project label: repo dir name is already clean
+        # (e.g. "Omphalis"); local dir is the encoded form
+        # ("-Users-StanSween-…-Omphalis"), trailing segment after final
+        # dash is usually the project name.
+        if repo_p:
+            project = repo_p.parent.name
+        elif local_p:
+            enc = local_p.parent.name
+            project = enc.rsplit("-", 1)[-1] if "-" in enc else enc
+        else:
+            project = ""
+
+        items.append({
+            "session_id": basename.removesuffix(".jsonl"),
+            "project": project,
+            "size": size,
+            "local_mtime": local_mt,
+            "repo_mtime": repo_mt,
+            "status": status,
+            # Lag is meaningful only when both sides exist and local is
+            # newer. For untracked / inbound, it's 0 (no comparable repo
+            # mtime); for synced, also 0 (no lag).
+            "lag_seconds": (
+                int(local_mt - repo_mt)
+                if (local_mt > repo_mt and repo_mt > 0)
+                else 0
+            ),
+        })
+
+    # Sort: most-lagged pending/stale first, then synced, oldest last.
+    rank = {"stale": 0, "pending": 1, "deploy-pending": 2,
+            "inbound": 3, "untracked": 4, "synced": 5}
+    items.sort(key=lambda i: (rank.get(i["status"], 9), -i["local_mtime"]))
+
+    summary = {
+        "total": len(items),
+        "synced": sum(1 for i in items if i["status"] == "synced"),
+        "pending": sum(1 for i in items if i["status"] == "pending"),
+        "stale": sum(1 for i in items if i["status"] == "stale"),
+        "inbound": sum(1 for i in items if i["status"] in
+                       ("inbound", "deploy-pending")),
+        "untracked": sum(1 for i in items if i["status"] == "untracked"),
+    }
+    return {"items": items, "summary": summary,
+            "idle_threshold_seconds": idle_threshold}
+
+
 # ── Status gathering ──────────────────────────────────────────────────
 
 
@@ -337,6 +448,7 @@ def gather_status(cfg: dict) -> dict:
         "conflicts": conflicts,
         "profiles": profiles,
         "tracked": tracked,
+        "sync_status": gather_sync_status(cfg),
         "log_tail": log_tail,
         "now": dt.datetime.utcnow().isoformat() + "Z",
     }
@@ -625,6 +737,20 @@ PAGE = r"""<!DOCTYPE html>
   </div>
 
   <div class="card">
+    <h2>Sync status</h2>
+    <div id="syncStatusSummary" class="empty" style="margin-bottom:8px;"></div>
+    <div id="syncStatusList"></div>
+    <div class="actions" style="margin-top:10px;">
+      <button id="actForceSync" class="primary">Force sync now</button>
+    </div>
+    <div class="empty" style="margin-top:8px;">
+      Active sessions are held locally for <span id="idleThresh">5 min</span>
+      before sync to prevent the dual-machine conflict storm. Force sync
+      pushes everything immediately for one cycle, regardless of mtime.
+    </div>
+  </div>
+
+  <div class="card">
     <h2>Peers</h2>
     <div id="peerList"></div>
   </div>
@@ -824,6 +950,64 @@ function render(s) {
     $("conflictsCard").hidden = true;
   }
 
+  // Sync status — per-session lag + force-sync UX
+  const ss = s.sync_status || {items: [], summary: {}, idle_threshold_seconds: 300};
+  const ssum = ss.summary;
+  const idleMin = Math.round((ss.idle_threshold_seconds || 300) / 60);
+  $("idleThresh").textContent = idleMin + " min";
+  const summaryParts = [];
+  if (ssum.synced) summaryParts.push(ssum.synced + " synced");
+  if (ssum.pending) summaryParts.push(ssum.pending + " pending");
+  if (ssum.stale) summaryParts.push(ssum.stale + " stale");
+  if (ssum.inbound) summaryParts.push(ssum.inbound + " inbound");
+  if (ssum.untracked) summaryParts.push(ssum.untracked + " untracked");
+  $("syncStatusSummary").textContent =
+    ssum.total === 0 ? "No tracked sessions yet."
+                     : summaryParts.join(" · ");
+  if (ss.items.length) {
+    const statusLabel = {
+      synced:           ["Synced", "good"],
+      pending:          ["Pending", "info"],
+      stale:            ["Stale", "warn"],
+      "deploy-pending": ["Inbound", "info"],
+      inbound:          ["Inbound (peer-only)", "info"],
+      untracked:        ["Local-only", "warn"],
+    };
+    const fmtAge = sec => {
+      if (sec < 60) return Math.floor(sec) + "s";
+      if (sec < 3600) return Math.floor(sec / 60) + "m";
+      if (sec < 86400) return Math.floor(sec / 3600) + "h";
+      return Math.floor(sec / 86400) + "d";
+    };
+    const now = Date.now() / 1000;
+    $("syncStatusList").innerHTML =
+      "<table><tr><th>Session</th><th>Status</th><th>Lag</th>" +
+      "<th>Last write</th><th>Size</th></tr>" +
+      ss.items.slice(0, 30).map(i => {
+        const [label, cls] = statusLabel[i.status] || [i.status, "info"];
+        const sid = i.session_id.length > 12
+          ? i.session_id.slice(0, 8) + "…"
+          : i.session_id;
+        const ageLocal = i.local_mtime ? fmtAge(now - i.local_mtime) + " ago" : "—";
+        const lag = i.lag_seconds > 0 ? fmtAge(i.lag_seconds) : "—";
+        return "<tr>" +
+          "<td><code>" + escape(sid) + "</code>" +
+            (i.project ? " <span class='dim'>" + escape(i.project) + "</span>" : "") +
+          "</td>" +
+          "<td><span class='pill " + cls + "'><span class='dot'></span>" + label + "</span></td>" +
+          "<td class='mono'>" + lag + "</td>" +
+          "<td class='mono'>" + ageLocal + "</td>" +
+          "<td class='mono'>" + fmtBytes(i.size) + "</td>" +
+          "</tr>";
+      }).join("") +
+      (ss.items.length > 30 ? "<tr><td colspan='5' class='empty'>… and " +
+       (ss.items.length - 30) + " more</td></tr>" : "") +
+      "</table>";
+  } else {
+    $("syncStatusList").innerHTML =
+      '<div class="empty">No session JSONLs found yet.</div>';
+  }
+
   // Profiles
   if (s.profiles.length) {
     $("profileList").innerHTML =
@@ -925,6 +1109,7 @@ async function action(path, btn) {
 }
 
 $("actSync").addEventListener("click", e => action("/api/sync", e.currentTarget));
+$("actForceSync").addEventListener("click", e => action("/api/force-sync", e.currentTarget));
 $("actPause").addEventListener("click", e =>
   action("/api/" + e.currentTarget.dataset.action, e.currentTarget));
 $("actClean").addEventListener("click", e => action("/api/clean-conflicts", e.currentTarget));
@@ -1017,14 +1202,23 @@ def _bin(name: str) -> Path:
     return tool_dir() / "bin" / name
 
 
-def _run_action(name: str, args: list[str]) -> tuple[bool, str]:
-    """Run a bin/<name> subcommand. Returns (ok, message)."""
+def _run_action(
+    name: str, args: list[str], env_overrides: dict | None = None
+) -> tuple[bool, str]:
+    """Run a bin/<name> subcommand. Returns (ok, message).
+
+    env_overrides: extra env vars to inject for this run only (e.g. set
+    DOTSYNC_SESSION_IDLE_THRESHOLD=0 for a force-sync).
+    """
     path = _bin(name)
     if not path.exists():
         return False, f"{name}: command not found"
+    env = None
+    if env_overrides:
+        env = {**os.environ, **{k: str(v) for k, v in env_overrides.items()}}
     try:
         proc = subprocess.run(
-            [str(path), *args], capture_output=True, text=True, timeout=60
+            [str(path), *args], capture_output=True, text=True, timeout=60, env=env
         )
     except Exception as e:
         return False, f"{name}: {e}"
@@ -1100,6 +1294,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if path == "/api/sync":
             ok, msg = _run_action("env-sync", [])
+        elif path == "/api/force-sync":
+            # Bypass the idle gate for one cycle: capture every tracked
+            # session JSONL regardless of mtime. Default threshold stays
+            # 5 min (storm protection); this is the explicit override.
+            ok, msg = _run_action(
+                "env-sync", [], {"DOTSYNC_SESSION_IDLE_THRESHOLD": "0"}
+            )
         elif path == "/api/pause":
             ok, msg = _run_action("dotsync-pause", [])
         elif path == "/api/resume":
