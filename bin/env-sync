@@ -4,6 +4,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/_common.sh"
 source "$SCRIPT_DIR/_crypt.sh"
 source "$SCRIPT_DIR/_registry.sh"
+source "$SCRIPT_DIR/_profile.sh"
 
 deploy_secrets() {
   local repo_p real_p
@@ -176,10 +177,20 @@ cd "$ENV_REPO_ROOT" || die "cannot cd to $ENV_REPO_ROOT"
 # 1. Capture local-machine state FIRST so any pending edits land in a commit
 #    before we fetch/rebase. Avoids "unstaged changes" rebase aborts when the
 #    working tree is dirty from a prior run or external edit.
-migrate_session_layout
+# Capture: in profile mode, use the declarative profile engine for
+# tool-specific paths; in legacy mode, use the hardcoded capture_*
+# functions. capture_secrets always runs because ad-hoc tracked items
+# (registered via 'dotsync track') live in secrets.json regardless of
+# profile mode.
 capture_secrets
-capture_sessions
-capture_dotfiles
+if profile_mode_active; then
+  log_info "profile mode: $(enabled_profiles | tr '\n' ' ')"
+  profile_run_all capture
+else
+  migrate_session_layout
+  capture_sessions
+  capture_dotfiles
+fi
 prune_sessions
 
 if [[ -n "$(git status --porcelain)" ]]; then
@@ -216,8 +227,12 @@ fi
 
 # 3. Deploy the merged state to canonical paths.
 deploy_secrets
-deploy_sessions
-deploy_dotfiles
+if profile_mode_active; then
+  profile_run_all deploy
+else
+  deploy_sessions
+  deploy_dotfiles
+fi
 
 # 4. Push any local commits we made in step 1.
 if [[ "$(git rev-parse HEAD)" != "$(git rev-parse origin/"$DOTSYNC_DATA_BRANCH")" ]]; then

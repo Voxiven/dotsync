@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+# dotsync-migrate — one-time migration from legacy paths to profile-driven layout.
+#
+# Legacy layout (pre-v0.3):
+#   sessions/<project>/*.jsonl
+#   dotfiles/{settings.json,CLAUDE.md}
+#   claude/memory/
+#   secrets/<repo_path>
+#
+# Profile layout (v0.3):
+#   claude-code/sessions/<project>/*.jsonl
+#   claude-code/dotfiles/{settings.json,CLAUDE.md}
+#   claude-code/memory/
+#   tracked/<repo_path>          (ad-hoc registry stays in secrets.json,
+#                                 but new tracks default to tracked/)
+#
+# Idempotent: detects if already migrated and exits cleanly. Run on ONE
+# machine; the migrated repo + enabled-profiles.json propagates to peers
+# on next sync.
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TOOL_DIR="$(dirname "$SCRIPT_DIR")"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_common.sh"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_crypt.sh"
+# shellcheck source=/dev/null
+source "$SCRIPT_DIR/_profile.sh"
+
+DRY_RUN=false
+PROFILES_TO_ENABLE="claude-code project-secrets"
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  cat <<EOF
+dotsync migrate — flip the data repo from legacy paths to profile layout.
+
+Usage: dotsync migrate [--dry-run] [--profiles "name1 name2 ..."]
+
+Options:
+  --dry-run        Show what would change; don't touch the repo.
+  --profiles       Profiles to enable post-migration (default: $PROFILES_TO_ENABLE).
+
+What it does:
+  1. Pauses the sync daemon (so it doesn't race the migration).
+  2. git mv legacy session/dotfile/memory paths under claude-code/.
+  3. Writes registry/enabled-profiles.json with the chosen profiles.
+  4. Commits and pushes.
+  5. Resumes the daemon.
+
+Run this on ONE machine. Other peers pull the migrated repo on their
+next sync — their engine notices enabled-profiles.json and switches to
+profile mode automatically.
+EOF
+  exit 0
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)  DRY_RUN=true; shift ;;
+    --profiles) PROFILES_TO_ENABLE="$2"; shift 2 ;;
+    *)          die "unknown flag: $1" ;;
+  esac
+done
+
+step() { printf '\n→ %s\n' "$*"; }
+say()  { printf '  %s\n' "$*"; }
+
+# ── Preflight ───────────────────────────────────────────────────────
+step "Preflight"
+[[ -d "$DOTSYNC_DATA_DIR/.git" ]] || die "no data repo at $DOTSYNC_DATA_DIR"
+cd "$DOTSYNC_DATA_DIR" || die "cd failed"
+
+if profile_mode_active && ! $DRY_RUN; then
+  say "already in profile mode — enabled: $(enabled_profiles | tr '\n' ' ')"
+  say "nothing to do. (run 'dotsync enable/disable' to change which profiles are on)"
+  exit 0
+fi
+
+# Make sure the working tree is clean.
+unlock_repo
+if [[ -n "$(git status --porcelain)" ]]; then
+  die "working tree dirty in $DOTSYNC_DATA_DIR — commit or stash first"
+fi
+
+# ── Pause daemon ────────────────────────────────────────────────────
+step "Pausing daemon"
+$DRY_RUN || set_paused
+say "(daemon will exit cleanly each cycle until resume)"
+
+# ── Plan + execute moves ────────────────────────────────────────────
+step "Planning moves"
+
+declare -a moves=(
+  "sessions:claude-code/sessions"
+  "dotfiles:claude-code/dotfiles"
+  "claude/memory:claude-code/memory"
+)
+
+any_move=false
+for m in "${moves[@]}"; do
+  src="${m%%:*}"
+  dst="${m##*:}"
+
+  if [[ ! -e "$src" ]]; then
+    say "skip: $src does not exist"
+    continue
+  fi
+  if [[ -e "$dst" ]]; then
+    say "skip: $dst already exists (merge candidate, doing rsync+rm)"
+    if ! $DRY_RUN; then
+      mkdir -p "$dst"
+      rsync -a "$src/" "$dst/"
+      git rm -rf "$src" >/dev/null
+    fi
+    any_move=true
+    continue
+  fi
+  say "move: $src → $dst"
+  if ! $DRY_RUN; then
+    mkdir -p "$(dirname "$dst")"
+    git mv "$src" "$dst" || die "git mv $src → $dst failed"
+  fi
+  any_move=true
+done
+
+# Drop empty parent dirs (claude/ if memory was its only child).
+if [[ ! $DRY_RUN ]] && [[ -d claude ]] && [[ -z "$(ls -A claude 2>/dev/null)" ]]; then
+  rmdir claude 2>/dev/null || true
+fi
+
+# ── Write enabled-profiles.json ─────────────────────────────────────
+step "Writing enabled-profiles.json"
+mkdir -p registry
+if $DRY_RUN; then
+  say "would enable: $PROFILES_TO_ENABLE"
+else
+  jq -n --arg list "$PROFILES_TO_ENABLE" \
+    '{profiles: ($list | split(" ") | map(select(length > 0)))}' \
+    > registry/enabled-profiles.json
+  say "enabled: $PROFILES_TO_ENABLE"
+fi
+
+# ── Update .gitattributes ────────────────────────────────────────────
+# Make sure the new profile prefixes are encrypted. If they're already
+# in .gitattributes, this is a no-op.
+step "Updating .gitattributes"
+ga=".gitattributes"
+need_update=false
+for prefix in claude-code project-secrets cursor aider tracked; do
+  grep -q "^${prefix}/\*\*" "$ga" 2>/dev/null && continue
+  need_update=true
+  $DRY_RUN || echo "${prefix}/**       filter=git-crypt diff=git-crypt" >> "$ga"
+done
+if $need_update; then
+  say "added missing encryption patterns"
+else
+  say "(already up to date)"
+fi
+
+# ── Commit + push ───────────────────────────────────────────────────
+if $DRY_RUN; then
+  step "Dry run — no commit/push"
+  echo
+  echo "Re-run without --dry-run to actually migrate."
+  $DRY_RUN || clear_paused
+  exit 0
+fi
+
+if [[ -n "$(git status --porcelain)" ]]; then
+  step "Committing migration"
+  git add -A
+  git commit -m "dotsync migrate v0.3: legacy paths → profile layout" --quiet \
+    || die "commit failed"
+  say "(committed)"
+  step "Pushing"
+  branch="${DOTSYNC_DATA_BRANCH:-$(git rev-parse --abbrev-ref HEAD)}"
+  git push origin "$branch" --quiet || die "push failed"
+  say "pushed to origin/$branch"
+else
+  say "no changes — already migrated"
+fi
+
+# ── Resume daemon ────────────────────────────────────────────────────
+step "Resuming daemon"
+clear_paused
+say "daemon will pick up profile mode on next tick"
+
+cat <<EOF
+
+✅ Migration complete.
+
+  Enabled profiles: $PROFILES_TO_ENABLE
+  Repo paths:       claude-code/, project-secrets/
+
+Other peers will switch to profile mode automatically on their next sync
+(once they pull the migrated repo and pick up enabled-profiles.json).
+
+Inspect:  dotsync status
+          dotsync ui
+EOF
