@@ -72,11 +72,9 @@ fi
 # Use existing registry add helper (writes to secrets.json).
 # Convention: "tracked" items go into secrets.json under repo paths starting
 # with "tracked/" — this is a single registry by design (one source of truth).
-$ENCRYPT && registry_add_secret "$REPO_PATH" "$templated" \
-  || registry_add_secret "$REPO_PATH" "$templated"
+registry_add_secret "$REPO_PATH" "$templated"
 
 echo "tracked: $real_path"
 echo "  repo:    $REPO_PATH"
-echo "  encrypted: $ENCRYPT"
 echo
 echo "It will be captured on the next sync (or run 'dotsync sync')."

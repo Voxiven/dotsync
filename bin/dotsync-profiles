@@ -37,14 +37,19 @@ is_enabled() {
 }
 
 if $json; then
-  jq -s --arg enabled "$enabled_list" '{
-    profiles: map({
-      name: .name,
-      description: .description,
-      experimental: (.experimental // false),
-      enabled: ($enabled | split(" ") | map(select(length > 0)) | index(.name) != null)
-    })
-  }' "$PROFILES_DIR"/*.json
+  # jq -s slurps each profile JSON into an array; .[] iterates them.
+  # Pre-compute enabled-set in jq, then iterate profiles and check
+  # membership. The earlier .name pipe trip-up was that `index(.name)`
+  # inside the split pipeline rebound `.` to the split array.
+  jq -sc --arg enabled "$enabled_list" '
+    ($enabled | split(" ") | map(select(length > 0))) as $en
+    | [.[] | . as $p | {
+        name: $p.name,
+        description: $p.description,
+        experimental: ($p.experimental // false),
+        enabled: ($en | index($p.name) != null)
+      }] | {profiles: .}
+  ' "$PROFILES_DIR"/*.json
   exit 0
 fi
 
