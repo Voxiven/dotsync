@@ -36,7 +36,9 @@ fi
 
 daemon_state="unknown"
 if command -v launchctl >/dev/null 2>&1; then
-  if launchctl list 2>/dev/null | grep -q "$DOTSYNC_KC_SERVICE"; then
+  # Don't use `grep -q` here: it exits on first match, SIGPIPEs the
+  # upstream `launchctl list`, and pipefail then reports failure.
+  if [[ -n "$(launchctl list 2>/dev/null | grep "$DOTSYNC_KC_SERVICE" || true)" ]]; then
     daemon_state="loaded"
   else
     daemon_state="not-loaded"
