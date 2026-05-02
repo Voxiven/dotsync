@@ -3,7 +3,7 @@
 **Multi-machine continuity for Claude Code and other AI dev tools.**
 Peer-to-peer, real-time, no cloud, no GitHub data repo, no copy-pasting secrets.
 
-> **Status: alpha.** Works for the author on two Macs. macOS-only today; Linux on the roadmap.
+> **Status: alpha (v0.8.0).** Works for the author on two Macs. macOS-only today; Linux on the roadmap.
 
 ---
 
@@ -45,17 +45,18 @@ Other tools (Cursor, Aider, etc.) ship as experimental [profiles](#profiles) and
 ### Install
 
 ```bash
-# Once the tap is published:
 brew tap voxiven/tap
 brew install dotsync
 ```
 
-Until the tap lands, you can clone + symlink:
+Or, for development from source:
 
 ```bash
 git clone https://github.com/Voxiven/dotsync.git ~/.dotsync-tool
 ln -sf ~/.dotsync-tool/bin/dotsync /usr/local/bin/dotsync
 ```
+
+> **`brew upgrade dotsync` doesn't auto-restart the daemons.** After upgrade, run `launchctl kickstart -k "gui/$(id -u)/dev.dotsync.envsync"` and the same for `dev.dotsync.ui`. The dashboard's version banner is the canary — if it doesn't match what `dotsync version` reports, the daemon is stale.
 
 ### Mac A — first machine
 
@@ -75,7 +76,10 @@ dotsync pair
 # Same install (brew tap voxiven/tap && brew install dotsync, or clone).
 
 # Join with the code from Mac A.
-dotsync join --code 4-foo-bar-baz
+# If your projects don't live at $HOME (e.g. they're under ~/Workspace,
+# ~/code, /Users/you/dev), pass --project-root so CC's per-project
+# encoded paths line up with Mac A's. Defaults to interactive prompt.
+dotsync join --code 4-foo-bar-baz --project-root ~/Workspace
 
 # join prints something like:
 #   "On the FIRST machine, run: dotsync add-peer XA7N5BU-..."
@@ -115,7 +119,7 @@ dotsync ui --install     # writes ~/Library/LaunchAgents/dev.dotsync.ui.plist + 
 dotsync ui --uninstall   # tears it down
 ```
 
-The agent runs `dotsync ui --background --no-open`, so the dashboard sits at `http://127.0.0.1:7878/` whenever you log in. Logs go to `~/Library/Logs/dotsync-ui.{out,err}.log`. The plist points at the `/opt/homebrew/bin/dotsync` symlink, so `brew upgrade dotsync` doesn't break the agent — the symlink re-points itself.
+The agent runs `dotsync ui --background --no-open`, so the dashboard sits at `http://127.0.0.1:7878/` whenever you log in. Logs go to `~/Library/Logs/dotsync-ui.{out,err}.log`. The plist points at the `/opt/homebrew/bin/dotsync` symlink, so the launchd entry itself survives `brew upgrade`. But the *running* Python process started against the old Cellar — kickstart it after upgrade (see install note above) to pick up new code.
 
 ### Remote dashboard
 
@@ -138,11 +142,17 @@ Two pieces:
 
 1. **[Syncthing](https://syncthing.net/)** does peer-to-peer file replication. TLS in transit between paired peers. Discovery servers see only device IDs (no content). No third-party storage, no cloud.
 
-2. **`dotsync`** wires CC's canonical paths (`~/.claude/settings.json`, etc.) into the Syncthing-replicated folder via **symlinks**. CC writes through the symlink → file lands directly in the Syncthing folder → replicated to peers in real time.
+2. **`dotsync`** wires CC's canonical paths into the Syncthing-replicated folder using two strategies, picked per path:
 
-Per-machine encoded paths are bridged transparently: Mac A's `~/.claude/projects/-Users-stan-Workspace-Omphalis/` and Mac B's `~/.claude/projects/-Users-jen-Code-Omphalis/` both map to the same `claude-code/sessions/Omphalis/` in the Syncthing folder.
+   - **Symlinks** for shared singletons (`~/.claude/settings.json`, `~/.claude/CLAUDE.md`, `~/.claude/agents/`, `~/.claude/commands/`, project `.env` files). CC writes through the symlink → file lands directly in the Syncthing folder → replicated to peers in real time. No daemon work.
 
-For files that can't be symlinked (per-project session jsonls, ad-hoc tracked items), there's a small launchd agent that runs every 60s and `rsync`s in/out — but most paths need no daemon work.
+   - **Per-machine capture/deploy with line-union merge** for files multiple machines actively write (per-project session JSONLs are the main case). A 60-second launchd agent captures each machine's writes into its own `claude-code/sessions/<machine>/<project>/` subdirectory under the Syncthing folder. Because each peer writes only to its own subdir, dual-writer collisions are impossible by construction. On deploy, the agent line-unions every peer's subdir (plus the local file) into the single canonical `~/.claude/projects/<encoded>/<session>.jsonl` — sorted by entry timestamp, deduped by line content, atomic rename to local. CC's open file descriptor on an active session is preserved when content is unchanged.
+
+Per-machine encoded paths are bridged: Mac A's `~/.claude/projects/-Users-stan-Workspace-Omphalis/` and Mac B's `~/.claude/projects/-Users-jen-code-Omphalis/` both write into `claude-code/sessions/<machine>/Omphalis/`, and each side's deploy reconstructs the locally-encoded path.
+
+### LAN convenience: `dotsync.local`
+
+The dashboard daemon publishes itself via mDNS as `dotsync.local`, so on the same WiFi any peer's UI is reachable at `http://dotsync.local:7878/` from any machine — no IP-hunting. Each machine's daemon publishes for itself; the name resolves to whichever publisher you ask first. Useful for quick "what's the other Mac doing" peeks without `dotsync ui --share`.
 
 ## What dotsync is *not*
 
@@ -228,35 +238,37 @@ If you want at-rest encryption for the dotsync folder specifically, encrypt the 
 
 ## Configuration
 
-`dotsync init` writes `~/.config/dotsync/config.sh`. Defaults:
+`dotsync init` writes `~/.config/dotsync/config.sh`. Typical contents:
 
 ```bash
+DOTSYNC_ENGINE="syncthing"
 DOTSYNC_DATA_DIR="${HOME}/.dotsync-data"
 DOTSYNC_KC_SERVICE="dev.dotsync.envsync"      # launchd service label
-DOTSYNC_PROJECT_ROOT="${HOME}/code"           # where your projects live
+DOTSYNC_PROJECT_ROOT="${HOME}"                # auto-detected; override with --project-root
 DOTSYNC_SESSION_MAX_MB=50                     # skip oversize jsonls
 DOTSYNC_SKIP_PROJECTS=""                      # space-separated names
 SYNCTHING_FOLDER_ID="dotsync-data"
 SYNCTHING_API_BASE="http://127.0.0.1:8384"
 ```
 
+`init` and `join` both auto-detect `DOTSYNC_PROJECT_ROOT` by scanning the most-likely parent dir for git repos. Override with `--project-root <path>` if your projects don't live there. Once set, this value drives the `${CC_ENCODED}` template the deploy uses to map peer subdirs back to the locally-encoded `~/.claude/projects/<encoded>/` directory — get it wrong and deploys land in the wrong place.
+
 Multiple parallel setups (work + personal) are supported by overriding `DOTSYNC_CONFIG`, `DOTSYNC_DATA_DIR`, and `DOTSYNC_KC_SERVICE` per-instance.
+
+Override per-machine name (used in `<machine>/<project>/` subdir) by setting `DOTSYNC_MACHINE_ID`. Defaults to `hostname -s` sanitized.
 
 ## Roadmap
 
-**Done (v0.4):**
-- Syncthing engine, peer-to-peer, no GitHub data repo
-- Symlinks for most paths (real-time sync, no daemon work for those)
-- Profile system: `claude-code`, `project-secrets`, plus experimental `cursor`/`aider`
-- One-command setup (`init` → `pair` → `join` → `add-peer`)
-- Cross-network pairing (magic-wormhole) and sync (Syncthing global discovery + relays)
-- Token-protected web dashboard at `localhost:7878`, optional public URL via `ui --share`
-- JSONL line-union merge for session conflicts (`clean-conflicts --merge`)
-- Auto-merge of session-jsonl conflicts every sync cycle (no manual cleanup)
-- `dotsync doctor` — 25-check setup + connectivity diagnostic
-- Homebrew tap (`brew tap voxiven/tap && brew install dotsync`)
-- 38 bats-core tests
-- `dotsync uninstall` / `setup-symlinks` / `no-daemon`
+**Shipped:**
+
+| Version | What changed |
+|---|---|
+| **v0.4** | Syncthing engine, peer-to-peer (no GitHub data repo). Symlinks for most paths. Profile system. One-command setup (`init` / `pair` / `join` / `add-peer`). Cross-network via magic-wormhole + Syncthing relays. Web dashboard with token auth + `ui --share` (Cloudflare quick tunnel). `dotsync doctor` diagnostic. Homebrew tap. |
+| **v0.6** | Per-project session capture/deploy via 60-second launchd agent. Idle-gated capture to prevent dual-writer storms (held active sessions local until 5 min idle). Auto-merge of `.sync-conflict-*` files. |
+| **v0.7** | mDNS publishing — `http://dotsync.local:7878/` from any peer on the LAN. Per-session sync-status surface in the dashboard. Cross-network probes in `dotsync doctor` (global discovery, relays, NAT traversal). |
+| **v0.8** | **Per-machine session subdirectories** — each peer captures only into `claude-code/sessions/<machine>/<project>/`, eliminating dual-writer collisions by construction. Idle gate removed. Deploy line-unions every peer's subdir (plus the local file), preserves CC's open fd via content-hash compare. Real-time sync, no waiting. |
+
+55 bats-core tests, ~5100 LOC of bash + one Python file (the dashboard).
 
 **Next:**
 - Linux support (systemd-user units instead of launchd; libsecret instead of Keychain)
@@ -275,7 +287,7 @@ cd dotsync
 ./bin/dotsync help
 ```
 
-Code is ~2500 LOC of bash + one Python file (the dashboard). Keep it that way.
+Code is ~5100 LOC of bash + one Python file (the dashboard). Keep it that way.
 
 Conventions:
 - Each subcommand is `bin/dotsync-<name>` (the dispatcher routes via `git`-style)
