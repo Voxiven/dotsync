@@ -121,54 +121,52 @@ JSON
   [[ -L "$src" ]]
 }
 
-# Helper: emit a session_jsonls profile pointing at $src (a project-local
-# sessions dir) and into $repo_subpath inside DOTSYNC_DATA_DIR.
+# 0.8.0+: profile uses ${MACHINE}/${PROJECT}/ in the to-path. Each peer
+# only writes to its own subdir; deploy unions all peers' subdirs +
+# legacy <project>/ location and atomically writes the merged result.
 _write_sessions_profile() {
-  local src="$1" repo_subpath="$2"
+  local src="$1"
   cat > "$TEST_PROFILE_DIR/test.json" <<JSON
 {"name":"test","schema_version":2,"iterates_per_project":false,
  "paths":[{"id":"sessions","type":"session_jsonls",
-           "from":"${src}/","to":"${repo_subpath}/",
+           "from":"${src}/","to":"test/sessions/\${MACHINE}/proj/",
            "max_file_mb":50}]}
 JSON
   echo '{"profiles":["test"]}' > "$ENABLED_PROFILES_FILE"
 }
 
-@test "session_jsonls: capture skips active session (mtime within idle threshold)" {
-  src="$HOME/.claude/projects/test"
-  mkdir -p "$src"
-  echo '{"line":1}' > "$src/active-session.jsonl"
-  # mtime is now (just created) → within default 300s idle threshold
-  _write_sessions_profile "$src" "test/sessions"
-
-  profile_run "test" capture
-
-  [[ ! -f "$DOTSYNC_DATA_DIR/test/sessions/active-session.jsonl" ]]
+@test "_machine_id sanitizes to filesystem-safe characters" {
+  source_internals
+  DOTSYNC_MACHINE_ID="hello world!@#$%" run _machine_id
+  [[ "$output" == "helloworld" ]]
 }
 
-@test "session_jsonls: capture catches idle session (mtime older than threshold)" {
-  src="$HOME/.claude/projects/test"
-  mkdir -p "$src"
-  echo '{"line":1}' > "$src/idle-session.jsonl"
-  # Backdate mtime to 1 hour ago (well past 300s default threshold).
-  touch -t "$(date -v-1H +%Y%m%d%H%M)" "$src/idle-session.jsonl"
-  _write_sessions_profile "$src" "test/sessions"
-
-  profile_run "test" capture
-
-  [[ -f "$DOTSYNC_DATA_DIR/test/sessions/idle-session.jsonl" ]]
+@test "_machine_id falls back to hostname -s when DOTSYNC_MACHINE_ID unset" {
+  source_internals
+  unset DOTSYNC_MACHINE_ID
+  run _machine_id
+  [[ -n "$output" ]]
+  [[ "$output" != *" "* ]]
 }
 
-@test "session_jsonls: capture honors DOTSYNC_SESSION_IDLE_THRESHOLD override" {
+@test "_expand_template substitutes \${MACHINE}" {
+  source_internals
+  DOTSYNC_MACHINE_ID="mac-a" run _expand_template 'sessions/${MACHINE}/proj/' ""
+  [[ "$output" == "sessions/mac-a/proj/" ]]
+}
+
+@test "session_jsonls: capture writes to per-machine subdir (no idle gate)" {
   src="$HOME/.claude/projects/test"
   mkdir -p "$src"
-  echo '{"line":1}' > "$src/recent.jsonl"
-  # Just-created file. With threshold=0 it should be treated as idle.
-  _write_sessions_profile "$src" "test/sessions"
+  echo '{"line":1}' > "$src/freshly-written.jsonl"
+  _write_sessions_profile "$src"
 
-  DOTSYNC_SESSION_IDLE_THRESHOLD=0 profile_run "test" capture
+  DOTSYNC_MACHINE_ID="mac-a" profile_run "test" capture
 
-  [[ -f "$DOTSYNC_DATA_DIR/test/sessions/recent.jsonl" ]]
+  # 0.8.0: even just-modified files capture immediately; no idle gate.
+  [[ -f "$DOTSYNC_DATA_DIR/test/sessions/mac-a/proj/freshly-written.jsonl" ]]
+  # And NOT in the legacy non-machine path.
+  [[ ! -f "$DOTSYNC_DATA_DIR/test/sessions/proj/freshly-written.jsonl" ]]
 }
 
 @test "session_jsonls: capture skips sync-conflict sidecars in source" {
@@ -176,80 +174,133 @@ JSON
   mkdir -p "$src"
   echo '{"line":1}' > "$src/abc.jsonl"
   echo '{"line":2}' > "$src/abc.sync-conflict-20260501-203217-XA7N5BU.jsonl"
-  touch -t "$(date -v-1H +%Y%m%d%H%M)" "$src/abc.jsonl" "$src/abc.sync-conflict-20260501-203217-XA7N5BU.jsonl"
-  _write_sessions_profile "$src" "test/sessions"
+  _write_sessions_profile "$src"
 
-  profile_run "test" capture
+  DOTSYNC_MACHINE_ID="mac-a" profile_run "test" capture
 
-  [[ -f "$DOTSYNC_DATA_DIR/test/sessions/abc.jsonl" ]]
-  [[ ! -f "$DOTSYNC_DATA_DIR/test/sessions/abc.sync-conflict-20260501-203217-XA7N5BU.jsonl" ]]
+  [[ -f "$DOTSYNC_DATA_DIR/test/sessions/mac-a/proj/abc.jsonl" ]]
+  [[ ! -f "$DOTSYNC_DATA_DIR/test/sessions/mac-a/proj/abc.sync-conflict-20260501-203217-XA7N5BU.jsonl" ]]
 }
 
-@test "session_jsonls: deploy preserves active local session (local newer than data dir)" {
+@test "session_jsonls: deploy line-union merges two peers' versions of same session" {
   src="$HOME/.claude/projects/test"
-  mkdir -p "$src"
-  repo="$DOTSYNC_DATA_DIR/test/sessions"
-  mkdir -p "$repo"
+  mkdir -p "$src" \
+           "$DOTSYNC_DATA_DIR/test/sessions/mac-a/proj" \
+           "$DOTSYNC_DATA_DIR/test/sessions/mac-b/proj"
 
-  # Older version in the data dir (would arrive via Syncthing from a peer).
-  echo '{"line":"old"}' > "$repo/contested.jsonl"
-  touch -t "$(date -v-1H +%Y%m%d%H%M)" "$repo/contested.jsonl"
+  # mac-a wrote lines 1, 2.
+  printf '{"timestamp":"2026-05-02T10:00:00Z","line":1}\n{"timestamp":"2026-05-02T10:01:00Z","line":2}\n' \
+    > "$DOTSYNC_DATA_DIR/test/sessions/mac-a/proj/abc.jsonl"
+  # mac-b wrote line 3 in between, line 4 after.
+  printf '{"timestamp":"2026-05-02T10:00:30Z","line":3}\n{"timestamp":"2026-05-02T10:02:00Z","line":4}\n' \
+    > "$DOTSYNC_DATA_DIR/test/sessions/mac-b/proj/abc.jsonl"
 
-  # Newer local version (CC actively writing).
-  echo '{"line":"local-active"}' > "$src/contested.jsonl"
-  # mtime is now → newer than data dir's mtime
-  _write_sessions_profile "$src" "test/sessions"
+  _write_sessions_profile "$src"
+  DOTSYNC_MACHINE_ID="mac-a" profile_run "test" deploy
 
-  profile_run "test" deploy
-
-  [[ "$(cat "$src/contested.jsonl")" == '{"line":"local-active"}' ]]
+  # Merged result: 4 unique lines, sorted by timestamp (1, 3, 2, 4).
+  [[ -f "$src/abc.jsonl" ]]
+  [[ "$(wc -l < "$src/abc.jsonl")" -eq 4 ]]
+  [[ "$(awk 'NR==1' "$src/abc.jsonl")" == *'"line":1'* ]]
+  [[ "$(awk 'NR==2' "$src/abc.jsonl")" == *'"line":3'* ]]
+  [[ "$(awk 'NR==3' "$src/abc.jsonl")" == *'"line":2'* ]]
+  [[ "$(awk 'NR==4' "$src/abc.jsonl")" == *'"line":4'* ]]
 }
 
-@test "session_jsonls: deploy overwrites local when data dir is newer" {
+@test "session_jsonls: deploy preserves local lines that haven't been captured yet" {
   src="$HOME/.claude/projects/test"
-  mkdir -p "$src"
-  repo="$DOTSYNC_DATA_DIR/test/sessions"
-  mkdir -p "$repo"
+  mkdir -p "$src" "$DOTSYNC_DATA_DIR/test/sessions/mac-a/proj"
 
-  # Older local version.
-  echo '{"line":"local-old"}' > "$src/closed.jsonl"
-  touch -t "$(date -v-1H +%Y%m%d%H%M)" "$src/closed.jsonl"
+  # Peer wrote one line.
+  printf '{"timestamp":"2026-05-02T10:00:00Z","line":"peer"}\n' \
+    > "$DOTSYNC_DATA_DIR/test/sessions/mac-a/proj/abc.jsonl"
+  # Local has another line CC just wrote (not yet captured to data dir).
+  printf '{"timestamp":"2026-05-02T10:01:00Z","line":"local-pending"}\n' \
+    > "$src/abc.jsonl"
+  # Backdate so race-protection (skip-if-fresh) doesn't kick in.
+  touch -t "$(date -v-1H +%Y%m%d%H%M)" "$src/abc.jsonl"
 
-  # Newer data-dir version (peer just sent us the closed session).
-  echo '{"line":"peer-fresh"}' > "$repo/closed.jsonl"
-  _write_sessions_profile "$src" "test/sessions"
+  _write_sessions_profile "$src"
+  DOTSYNC_MACHINE_ID="mac-a" profile_run "test" deploy
 
-  profile_run "test" deploy
-
-  [[ "$(cat "$src/closed.jsonl")" == '{"line":"peer-fresh"}' ]]
+  # Both lines must survive the merge.
+  grep -q '"line":"peer"' "$src/abc.jsonl"
+  grep -q '"line":"local-pending"' "$src/abc.jsonl"
 }
 
-@test "session_jsonls: deploy excludes sync-conflict sidecars from data dir" {
+@test "session_jsonls: deploy reads legacy 0.7.x location (graceful migration)" {
   src="$HOME/.claude/projects/test"
-  mkdir -p "$src"
-  repo="$DOTSYNC_DATA_DIR/test/sessions"
-  mkdir -p "$repo"
-  echo '{"line":1}' > "$repo/abc.jsonl"
-  echo '{"line":2}' > "$repo/abc.sync-conflict-20260501-203217-XA7N5BU.jsonl"
-  _write_sessions_profile "$src" "test/sessions"
+  mkdir -p "$src" "$DOTSYNC_DATA_DIR/test/sessions/proj"
 
-  profile_run "test" deploy
+  # Legacy: pre-0.8.0 layout, no <machine>/ prefix.
+  printf '{"timestamp":"2026-05-02T10:00:00Z","line":"legacy"}\n' \
+    > "$DOTSYNC_DATA_DIR/test/sessions/proj/legacy-session.jsonl"
+
+  _write_sessions_profile "$src"
+  DOTSYNC_MACHINE_ID="mac-a" profile_run "test" deploy
+
+  # Deploy still picks up legacy files so users on mid-migration setups
+  # don't lose access to their old sessions.
+  [[ -f "$src/legacy-session.jsonl" ]]
+  grep -q '"line":"legacy"' "$src/legacy-session.jsonl"
+}
+
+@test "session_jsonls: deploy excludes sync-conflict sidecars from peer subdirs" {
+  src="$HOME/.claude/projects/test"
+  mkdir -p "$src" "$DOTSYNC_DATA_DIR/test/sessions/mac-a/proj"
+  echo '{"line":1}' > "$DOTSYNC_DATA_DIR/test/sessions/mac-a/proj/abc.jsonl"
+  echo '{"line":2}' > "$DOTSYNC_DATA_DIR/test/sessions/mac-a/proj/abc.sync-conflict-20260501-203217-XA7N5BU.jsonl"
+
+  _write_sessions_profile "$src"
+  DOTSYNC_MACHINE_ID="mac-a" profile_run "test" deploy
 
   [[ -f "$src/abc.jsonl" ]]
   [[ ! -f "$src/abc.sync-conflict-20260501-203217-XA7N5BU.jsonl" ]]
 }
 
+@test "session_jsonls: deploy is a no-op when merged content matches local (preserves CC's open fd)" {
+  src="$HOME/.claude/projects/test"
+  mkdir -p "$src" "$DOTSYNC_DATA_DIR/test/sessions/mac-a/proj"
+  printf '{"line":"x"}\n' > "$DOTSYNC_DATA_DIR/test/sessions/mac-a/proj/abc.jsonl"
+  printf '{"line":"x"}\n' > "$src/abc.jsonl"
+  touch -t "$(date -v-1H +%Y%m%d%H%M)" "$src/abc.jsonl"
+  local inode_before
+  inode_before=$(stat -f '%i' "$src/abc.jsonl")
+
+  _write_sessions_profile "$src"
+  DOTSYNC_MACHINE_ID="mac-a" profile_run "test" deploy
+
+  # No content change → no atomic-rename → same inode (CC's open fd
+  # would still be valid). Critical for not losing in-flight CC writes.
+  local inode_after
+  inode_after=$(stat -f '%i' "$src/abc.jsonl")
+  [[ "$inode_before" == "$inode_after" ]]
+}
+
+@test "session_jsonls: deploy skips local files written within the last 2s (race protection)" {
+  src="$HOME/.claude/projects/test"
+  mkdir -p "$src" "$DOTSYNC_DATA_DIR/test/sessions/mac-a/proj"
+  # Peer pushed a different version.
+  printf '{"line":"from-peer"}\n' > "$DOTSYNC_DATA_DIR/test/sessions/mac-a/proj/abc.jsonl"
+  # Local was just modified (within 2s) — CC may be mid-append.
+  printf '{"line":"in-flight"}\n' > "$src/abc.jsonl"
+
+  _write_sessions_profile "$src"
+  DOTSYNC_MACHINE_ID="mac-a" profile_run "test" deploy
+
+  # Local content unchanged this cycle. Next cycle (>2s later) merges it.
+  [[ "$(cat "$src/abc.jsonl")" == '{"line":"in-flight"}' ]]
+}
+
 @test "session_jsonls: deploy cleans up legacy sidecar already in destination" {
   src="$HOME/.claude/projects/test"
-  mkdir -p "$src"
-  repo="$DOTSYNC_DATA_DIR/test/sessions"
-  mkdir -p "$repo"
-  echo '{"line":1}' > "$repo/abc.jsonl"
+  mkdir -p "$src" "$DOTSYNC_DATA_DIR/test/sessions/mac-a/proj"
+  echo '{"line":1}' > "$DOTSYNC_DATA_DIR/test/sessions/mac-a/proj/abc.jsonl"
   # Pre-existing legacy sidecar in $src from a 0.5.x deploy.
   echo '{"stale":1}' > "$src/abc.sync-conflict-20260501-203217-XA7N5BU.jsonl"
-  _write_sessions_profile "$src" "test/sessions"
 
-  profile_run "test" deploy
+  _write_sessions_profile "$src"
+  DOTSYNC_MACHINE_ID="mac-a" profile_run "test" deploy
 
   [[ -f "$src/abc.jsonl" ]]
   [[ ! -f "$src/abc.sync-conflict-20260501-203217-XA7N5BU.jsonl" ]]

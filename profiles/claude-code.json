@@ -33,11 +33,11 @@
       "id": "sessions",
       "type": "session_jsonls",
       "from": "${HOME}/.claude/projects/${CC_ENCODED}/",
-      "to": "claude-code/sessions/${PROJECT}/",
+      "to": "claude-code/sessions/${MACHINE}/${PROJECT}/",
       "include_globs": ["*.jsonl"],
       "exclude_dirs": ["subagents"],
       "max_file_mb": 50,
-      "_note": "Sessions still go through capture/deploy in v0.4 — the project-dir symlink path requires .stignore handling for subagents/ and is deferred to a future phase. session_jsonls in syncthing mode just rsyncs jsonls into the Syncthing-replicated folder; no rebase races possible here because Syncthing has no checkout step."
+      "_note": "0.8.0+: per-machine subdirectories. Each peer captures only into its own ${MACHINE}/ subdir, eliminating dual-writer collisions. Deploy walks all peers' subdirs (claude-code/sessions/*/${PROJECT}/) PLUS the legacy 0.7.x location (claude-code/sessions/${PROJECT}/) and line-union merges them into ${HOME}/.claude/projects/${CC_ENCODED}/. No idle gate needed — convergence is structural, not timing-based."
     },
     {
       "id": "memory",

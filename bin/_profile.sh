@@ -34,9 +34,11 @@ enabled_profiles() {
 }
 
 # Expand template variables in a string.
-# ${HOME}, ${DOTSYNC_PROJECT_ROOT}, ${PROJECT}, ${CC_ENCODED}.
+# ${HOME}, ${DOTSYNC_PROJECT_ROOT}, ${PROJECT}, ${CC_ENCODED}, ${MACHINE}.
 # CC_ENCODED is computed from project root + project name with '/' → '-',
 # matching Claude Code's per-machine encoded path scheme.
+# MACHINE is the local hostname, sanitized (alnum + dash + underscore),
+# used for per-machine subdirectories so concurrent writers never collide.
 _expand_template() {
   local s="$1"
   local project="${2:-}"
@@ -45,6 +47,7 @@ _expand_template() {
   s="${s//\$\{HOME\}/$HOME}"
   s="${s//\$\{DOTSYNC_PROJECT_ROOT\}/$proot}"
   s="${s//\$\{PROJECT\}/$project}"
+  s="${s//\$\{MACHINE\}/$(_machine_id)}"
 
   if [[ -n "$project" ]]; then
     local encoded
@@ -53,6 +56,13 @@ _expand_template() {
   fi
 
   echo "$s"
+}
+
+# Stable per-machine identifier. Defaults to short hostname; overridable
+# via $DOTSYNC_MACHINE_ID for testing. Sanitized to filesystem-safe chars.
+_machine_id() {
+  local raw="${DOTSYNC_MACHINE_ID:-$(hostname -s 2>/dev/null || echo unknown)}"
+  echo "$raw" | tr -dc '[:alnum:]_-'
 }
 
 # Run all enabled profiles for the given action (capture or deploy).
@@ -219,16 +229,12 @@ _profile_path_session_jsonls() {
   local action="$1" from="$2" to="$3" max_mb="$4"
   local repo_full="$ENV_REPO_ROOT/$to"
   local skip="${DOTSYNC_SKIP_PROJECTS:-}"
-  # Sessions modified more recently than this are "active" and stay
-  # local — only captured/deployed once the writer has paused. This
-  # prevents the dual-machine same-session conflict storm: when both
-  # peers append to the same active JSONL, Syncthing creates a sidecar
-  # every few seconds and no merge cadence can keep up. Idle-gating
-  # means convergence only happens once per close, not per write.
-  local idle_secs="${DOTSYNC_SESSION_IDLE_THRESHOLD:-300}"
 
-  # Honor skip list — if to-path's last segment matches a skip token,
-  # don't capture or deploy.
+  # Honor skip list — if the project segment matches a skip token, no-op.
+  # The "project" segment is the second-to-last (last is ${MACHINE} stripped
+  # by template? no — to ends with /${PROJECT}/, so last segment IS project.
+  # Actually with new template "claude-code/sessions/${MACHINE}/${PROJECT}/",
+  # last segment after strip is ${PROJECT}. Same check works.
   local last="${to%/}"; last="${last##*/}"
   if [[ " $skip " == *" $last "* ]]; then
     case "$action" in
@@ -239,49 +245,126 @@ _profile_path_session_jsonls() {
 
   case "$action" in
     capture)
+      # 0.8.0+: each machine writes ONLY to its own subdirectory under
+      # claude-code/sessions/<machine>/<project>/. No collision possible
+      # across peers, so the idle gate that 0.6.0 added is gone — capture
+      # every cycle, immediately. Convergence happens at deploy time via
+      # line-union merge of all peers' subdirs.
       [[ -d "${from%/}" ]] || return 0
       mkdir -p "$repo_full"
-      local now epoch_cutoff
-      now=$(date +%s)
-      epoch_cutoff=$((now - idle_secs))
-      # Skip active sessions (mtime within $idle_secs) and any
-      # sync-conflict sidecars that may have leaked into the source dir
-      # from earlier 0.5.x deploys.
       find "${from%/}" -maxdepth 1 -name '*.jsonl' -size "-${max_mb}M" \
         ! -name '*.sync-conflict-*' 2>/dev/null \
         | while read -r jf; do
-            local mt
-            mt=$(stat -f '%m' "$jf" 2>/dev/null || echo 0)
-            [[ "$mt" -gt "$epoch_cutoff" ]] && continue
             rsync -a --checksum "$jf" "$repo_full/$(basename "$jf")"
           done
       ;;
     deploy)
-      [[ -d "${repo_full%/}" ]] || return 0
+      # 0.8.0+: collect this project's session files from EVERY peer's
+      # subdirectory (claude-code/sessions/*/<project>/) plus the legacy
+      # 0.7.x location (claude-code/sessions/<project>/) for graceful
+      # migration. Line-union merge all sources of each session_id and
+      # atomically write to local. Convergence in one cycle per direction.
       mkdir -p "${from%/}"
-      # Per-file deploy: only overwrite local if the data-dir copy is
-      # newer or local doesn't exist. Protects an active local session
-      # from being clobbered by stale state replicated from a peer.
-      # Also excludes sync-conflict sidecars — they'd otherwise show up
-      # in CC's session picker as ghost resumable sessions.
-      find "${repo_full%/}" -maxdepth 1 -name '*.jsonl' \
-        ! -name '*.sync-conflict-*' 2>/dev/null \
-        | while read -r src; do
-            local dst="${from%/}/$(basename "$src")"
-            if [[ -f "$dst" ]]; then
-              local src_mt dst_mt
-              src_mt=$(stat -f '%m' "$src" 2>/dev/null || echo 0)
-              dst_mt=$(stat -f '%m' "$dst" 2>/dev/null || echo 0)
-              [[ "$dst_mt" -gt "$src_mt" ]] && continue
-            fi
-            rsync -a --checksum "$src" "$dst"
-          done
-      # Cleanup: any sidecar left over in $from from earlier 0.5.x
-      # deploys gets removed. Idempotent — safe to run every cycle.
+      local project peers_root
+      project="$(basename "${to%/}")"
+      # to is "claude-code/sessions/<machine>/<project>/" → strip last 2.
+      peers_root="$(dirname "$(dirname "$repo_full")")"
+      [[ -d "$peers_root" ]] || return 0
+      _deploy_session_jsonls "$peers_root" "$project" "${from%/}"
+      # Cleanup: legacy sidecars in $from from earlier 0.5.x deploys.
       find "${from%/}" -maxdepth 1 -name '*.sync-conflict-*.jsonl' -type f \
         -delete 2>/dev/null || true
       ;;
   esac
+}
+
+# Walk every peer's <machine>/<project>/ subdir plus the legacy
+# <project>/ location, collect all source files keyed by session basename,
+# line-union merge each set into the corresponding local file. Done in
+# Python because we need stable iteration over an arbitrary number of
+# input files plus content-hash comparison to avoid touching unchanged
+# files (atomic rename invalidates CC's open fd → loses in-flight
+# appends).
+_deploy_session_jsonls() {
+  local peers_root="$1" project="$2" dst_dir="$3"
+  python3 - "$peers_root" "$project" "$dst_dir" <<'PY'
+import hashlib, json, os, sys, time
+from pathlib import Path
+
+peers_root = Path(sys.argv[1])
+project = sys.argv[2]
+dst_dir = Path(sys.argv[3])
+dst_dir.mkdir(parents=True, exist_ok=True)
+
+# Collect: session_basename -> [source files...]
+sources: dict[str, list[Path]] = {}
+# Per-machine subdirs: peers_root/<machine>/<project>/*.jsonl
+for machine_dir in peers_root.iterdir():
+    if not machine_dir.is_dir():
+        continue
+    proj_dir = machine_dir / project
+    if not proj_dir.is_dir():
+        continue
+    for f in proj_dir.glob("*.jsonl"):
+        if "sync-conflict" in f.name:
+            continue
+        sources.setdefault(f.name, []).append(f)
+# Legacy 0.7.x location: peers_root/<project>/*.jsonl
+legacy_proj = peers_root / project
+if legacy_proj.is_dir():
+    for f in legacy_proj.glob("*.jsonl"):
+        if "sync-conflict" in f.name:
+            continue
+        sources.setdefault(f.name, []).append(f)
+
+now = time.time()
+for basename, srcs in sources.items():
+    dst = dst_dir / basename
+    # Race protection: if local was written within the last 2 sec, CC
+    # may be mid-append. Skip this cycle — next cycle picks it up.
+    if dst.exists() and (now - dst.stat().st_mtime) < 2:
+        continue
+    # Include local in the union so its lines are preserved (CC may
+    # have appended since the last capture).
+    inputs = list(srcs) + ([dst] if dst.exists() else [])
+    seen, entries = set(), []
+    idx = 0
+    for src in inputs:
+        last_ts = ""
+        try:
+            with src.open() as f:
+                for raw in f:
+                    line = raw.rstrip("\n")
+                    if not line or line in seen:
+                        continue
+                    seen.add(line)
+                    ts = None
+                    try:
+                        obj = json.loads(line)
+                        ts = obj.get("timestamp")
+                    except Exception:
+                        pass
+                    if ts is not None:
+                        last_ts = ts
+                    entries.append((last_ts, idx, line))
+                    idx += 1
+        except OSError:
+            pass
+    entries.sort(key=lambda e: (e[0], e[1]))
+    new_content = "".join(line + "\n" for _, _, line in entries)
+    new_hash = hashlib.sha256(new_content.encode()).hexdigest()
+    old_hash = None
+    if dst.exists():
+        try:
+            old_hash = hashlib.sha256(dst.read_bytes()).hexdigest()
+        except OSError:
+            pass
+    if old_hash == new_hash:
+        continue  # no change → don't touch (preserves CC's open fd)
+    tmp = dst.with_suffix(dst.suffix + ".dotsync-tmp")
+    tmp.write_text(new_content)
+    os.replace(tmp, dst)
+PY
 }
 
 _profile_path_symlink_file() {
